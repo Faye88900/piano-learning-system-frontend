@@ -1,7 +1,7 @@
 ﻿"use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { signOut } from "firebase/auth";
 import {addDoc,collection,collectionGroup,onSnapshot,orderBy,query,serverTimestamp,where,} from "firebase/firestore";
@@ -18,8 +18,6 @@ const roleLabels = {
 export default function DashboardPage() {
 
   const router = useRouter();
-  const pathname = usePathname();
-  const searchParams = useSearchParams();
   const { sessionUser, loading } = useSessionUser();
   const currentUid = auth.currentUser?.uid;
   const [enrolledCourses, setEnrolledCourses] = useState([]);
@@ -454,43 +452,6 @@ export default function DashboardPage() {
       .filter(Boolean);
   }, [searchKeyword, enrichedEnrolledCourses]);
 
-  const paymentParam = searchParams?.get("payment");
-  const [paymentBanner, setPaymentBanner] = useState(null);
-
-  useEffect(() => {
-    if (!paymentParam) return;
-
-    const banner =
-      paymentParam === "success"
-        ? {
-            tone: "success",
-            title: "Payment successful",
-            message: "Thank you! Your payment was received. Enrollment will show as paid shortly.",
-          }
-        : paymentParam === "cancelled"
-        ? {
-            tone: "warn",
-            title: "Payment cancelled",
-            message: "No charge was made. You can retry payment from the course page.",
-          }
-        : null;
-
-    if (!banner) return;
-
-    setPaymentBanner(banner);
-
-   // 清除查询参数，使横幅只显示一次
-    const params = new URLSearchParams(searchParams?.toString() || "");
-    params.delete("payment");
-    router.replace(params.toString() ? `${pathname}?${params}` : pathname, { scroll: false });
-  }, [paymentParam, pathname, router, searchParams]);
-
-  useEffect(() => {
-    if (!paymentBanner) return undefined;
-    const timer = setTimeout(() => setPaymentBanner(null), 6000);
-    return () => clearTimeout(timer);
-  }, [paymentBanner]);
-
   async function handleCreateRescheduleRequest(session, payload) {
     if (!sessionUser) return;
     if (!session?.id) return;
@@ -748,13 +709,9 @@ export default function DashboardPage() {
             onSignOut={handleSignOut}
           />
           <div style={{ flex: "1 1 640px", minWidth: "0", display: "grid", gap: "24px" }}>
-            {paymentBanner ? (
-              <SectionCard
-                title={paymentBanner.title}
-                description={paymentBanner.message}
-                actions={[]}
-              />
-            ) : null}
+            <Suspense fallback={null}>
+              <PaymentNotice />
+            </Suspense>
             <StudentHero
               sessionUser={sessionUser}
               upcomingLessons={upcomingSessionCount}
@@ -793,6 +750,58 @@ export default function DashboardPage() {
         </div>
       )}
     </main>
+  );
+}
+
+function PaymentNotice() {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const [paymentBanner, setPaymentBanner] = useState(null);
+
+  useEffect(() => {
+    const paymentParam = searchParams?.get("payment");
+    if (!paymentParam) return;
+
+    const banner =
+      paymentParam === "success"
+        ? {
+            tone: "success",
+            title: "Payment successful",
+            message: "Thank you! Your payment was received. Enrollment will show as paid shortly.",
+          }
+        : paymentParam === "cancelled"
+        ? {
+            tone: "warn",
+            title: "Payment cancelled",
+            message: "No charge was made. You can retry payment from the course page.",
+          }
+        : null;
+
+    if (!banner) return;
+
+    setPaymentBanner(banner);
+
+    // Clear the query param so the banner only shows once.
+    const params = new URLSearchParams(searchParams?.toString() || "");
+    params.delete("payment");
+    router.replace(params.toString() ? `${pathname}?${params}` : pathname, { scroll: false });
+  }, [pathname, router, searchParams]);
+
+  useEffect(() => {
+    if (!paymentBanner) return undefined;
+    const timer = setTimeout(() => setPaymentBanner(null), 6000);
+    return () => clearTimeout(timer);
+  }, [paymentBanner]);
+
+  if (!paymentBanner) return null;
+
+  return (
+    <SectionCard
+      title={paymentBanner.title}
+      description={paymentBanner.message}
+      actions={[]}
+    />
   );
 }
 
