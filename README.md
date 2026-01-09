@@ -35,6 +35,13 @@ The system is designed for **Students** and **Teachers**, providing role-based f
 - Online payment integration for course enrollment
 
 ---
+## Live Demo
+
+The application is deployed on Vercel and available at:
+
+🔗 https://piano-learning-system-frontend-zfe2.vercel.app
+
+Payment is integrated using Stripe Checkout in **test mode**. No real payment is required.
 
 ## System Demo Flow
 
