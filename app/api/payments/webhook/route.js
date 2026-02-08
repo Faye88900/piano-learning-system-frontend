@@ -29,12 +29,61 @@ export async function POST(req) {
       const session = event.data.object;
       const { enrollmentId, courseId } = session.metadata || {};
       if (enrollmentId) {
+        const paymentIntentId =
+          typeof session.payment_intent === "string"
+            ? session.payment_intent
+            : session.payment_intent?.id || "";
+        let receiptUrl = "";
+        let amountReceived = null;
+        let currency = "";
+
+        if (paymentIntentId) {
+          try {
+            const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId, {
+              expand: ["latest_charge"],
+            });
+            amountReceived =
+              typeof paymentIntent.amount_received === "number"
+                ? paymentIntent.amount_received
+                : paymentIntent.amount ?? null;
+            currency = paymentIntent.currency || "";
+
+            const latestCharge =
+              typeof paymentIntent.latest_charge === "string"
+                ? null
+                : paymentIntent.latest_charge;
+            receiptUrl = latestCharge?.receipt_url || "";
+
+            if (!receiptUrl) {
+              const chargeId =
+                typeof paymentIntent.latest_charge === "string"
+                  ? paymentIntent.latest_charge
+                  : latestCharge?.id;
+              if (chargeId) {
+                const charge = await stripe.charges.retrieve(chargeId);
+                receiptUrl = charge?.receipt_url || "";
+              } else {
+                const charges = await stripe.charges.list({
+                  payment_intent: paymentIntentId,
+                  limit: 1,
+                });
+                receiptUrl = charges.data?.[0]?.receipt_url || "";
+              }
+            }
+          } catch (error) {
+            console.error("Failed to retrieve payment intent/receipt", error);
+          }
+        }
+
         await adminDb.collection("enrollments").doc(enrollmentId).set(
           {
             status: "Paid",
             paymentStatus: "paid",
-            paymentIntentId: session.payment_intent || "",
+            paymentIntentId,
             paymentProvider: "stripe",
+            paymentAmount: amountReceived,
+            paymentCurrency: currency,
+            paymentReceiptUrl: receiptUrl,
             paidAt: new Date().toISOString(),
             courseId: courseId || "",
           },

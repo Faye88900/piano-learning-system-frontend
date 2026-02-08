@@ -452,6 +452,14 @@ export default function DashboardPage() {
       .filter(Boolean);
   }, [searchKeyword, enrichedEnrolledCourses]);
 
+  const paidCourses = useMemo(() => {
+    return enrichedEnrolledCourses.filter((course) => {
+      const enrollment = course.enrollment || {};
+      const status = typeof enrollment.status === "string" ? enrollment.status.toLowerCase() : "";
+      return enrollment.paymentStatus === "paid" || status === "paid";
+    });
+  }, [enrichedEnrolledCourses]);
+
   async function handleCreateRescheduleRequest(session, payload) {
     if (!sessionUser) return;
     if (!session?.id) return;
@@ -640,6 +648,14 @@ export default function DashboardPage() {
       description: "Review completion percentages and instructor milestones.",
       content: <StudentProgress enrolledCourses={enrichedEnrolledCourses} />,
     },
+    {
+      id: "payments",
+      label: "Payments",
+      badge: paidCourses.length ? `${paidCourses.length} paid` : "No payments",
+      title: "Payment records",
+      description: "View paid invoices and download receipts.",
+      content: <StudentPayments paidCourses={paidCourses} />,
+    },
   ];
 
   const activeTabDefinition =
@@ -669,6 +685,12 @@ export default function DashboardPage() {
       label: "Progress",
       description: "Milestones & notes",
       icon: "📈",
+    },
+    {
+      id: "payments",
+      label: "Payments",
+      description: "Receipts & history",
+      icon: "💳",
     },
   ];
   const studentQuickLinks = [
@@ -2165,6 +2187,129 @@ function StudentProgress({ enrolledCourses }) {
                 : "Instructor has not updated progress yet."}
             </p>
           </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function StudentPayments({ paidCourses }) {
+  if (!paidCourses?.length) {
+    return (
+      <p style={{ marginTop: "14px", fontSize: "13px", color: "#475569" }}>
+        No completed payments yet. Paid enrollments will appear here with receipts.
+      </p>
+    );
+  }
+
+  const formatAmount = (amount, currency) => {
+    if (typeof amount !== "number") return "—";
+    const code = (currency || "MYR").toUpperCase();
+    try {
+      return new Intl.NumberFormat("en-MY", { style: "currency", currency: code }).format(
+        amount / 100
+      );
+    } catch (error) {
+      return `${(amount / 100).toFixed(2)} ${code}`;
+    }
+  };
+
+  return (
+    <div style={{ marginTop: "14px", display: "grid", gap: "14px" }}>
+      {paidCourses.map((course) => {
+        const enrollment = course.enrollment || {};
+        const receiptUrl = enrollment.paymentReceiptUrl || "";
+        const amountLabel = formatAmount(enrollment.paymentAmount, enrollment.paymentCurrency);
+        const paidAt = enrollment.paidAt || enrollment.enrolledAt || "";
+        const paidLabel = paidAt ? new Date(paidAt).toLocaleString() : "—";
+
+        return (
+          <article
+            key={course.id}
+            style={{
+              borderRadius: "16px",
+              border: "1px solid rgba(226,232,240,0.9)",
+              padding: "16px",
+              backgroundColor: "white",
+              boxShadow: "0 12px 24px rgba(15,23,42,0.04)",
+              display: "grid",
+              gap: "10px",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+              <div>
+                <h3 style={{ margin: 0, fontSize: "15px", fontWeight: 600, color: "#0f172a" }}>
+                  {course.title}
+                </h3>
+                <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#64748b" }}>
+                  Instructor: {course.teacher}
+                </p>
+              </div>
+              <span
+                style={{
+                  alignSelf: "flex-start",
+                  padding: "4px 12px",
+                  borderRadius: "999px",
+                  fontSize: "12px",
+                  fontWeight: 600,
+                  backgroundColor: "rgba(34,197,94,0.12)",
+                  color: "#15803d",
+                }}
+              >
+                Paid
+              </span>
+            </div>
+
+            <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "12px", color: "#475569" }}>
+              <span>Amount: <strong style={{ color: "#0f172a" }}>{amountLabel}</strong></span>
+              <span>Paid at: <strong style={{ color: "#0f172a" }}>{paidLabel}</strong></span>
+            </div>
+
+            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+              <Link
+                href={`/courses/${course.id}`}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  padding: "8px 14px",
+                  borderRadius: "999px",
+                  border: "1px solid rgba(148,163,184,0.5)",
+                  backgroundColor: "white",
+                  color: "#0f172a",
+                  textDecoration: "none",
+                  fontSize: "12px",
+                  fontWeight: 600,
+                }}
+              >
+                View course
+              </Link>
+              {receiptUrl ? (
+                <a
+                  href={receiptUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    padding: "8px 14px",
+                    borderRadius: "999px",
+                    border: "1px solid rgba(37,99,235,0.4)",
+                    backgroundColor: "rgba(37,99,235,0.08)",
+                    color: "#1d4ed8",
+                    textDecoration: "none",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                  }}
+                >
+                  Open receipt
+                </a>
+              ) : (
+                <span style={{ fontSize: "12px", color: "#94a3b8" }}>Receipt pending</span>
+              )}
+            </div>
+          </article>
         );
       })}
     </div>
