@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import Link from "next/link";
+import Image from "next/image";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { signOut } from "firebase/auth";
@@ -14,6 +15,51 @@ const roleLabels = {
   teacher: "Teacher",
   admin: "Admin",
 };
+
+function hasPaidAccess(enrollment) {
+  if (!enrollment) return false;
+  const enrollmentStatus =
+    typeof enrollment.status === "string" ? enrollment.status.toLowerCase() : "";
+  return (
+    enrollment.paymentStatus === "paid" ||
+    enrollmentStatus === "paid" ||
+    Boolean(enrollment.paidAt || enrollment.paymentReceiptUrl || enrollment.paymentIntentId)
+  );
+}
+
+function getEnrollmentSortTime(entry) {
+  const candidates = [entry?.paidAt, entry?.enrolledAt, entry?.updatedAt];
+  for (const value of candidates) {
+    if (!value) continue;
+    const ms = new Date(value).getTime();
+    if (Number.isFinite(ms)) return ms;
+  }
+  return 0;
+}
+
+function choosePreferredEnrollment(current, next) {
+  if (!current) return next;
+
+  const currentPaid = hasPaidAccess(current);
+  const nextPaid = hasPaidAccess(next);
+  if (currentPaid !== nextPaid) {
+    return nextPaid ? next : current;
+  }
+
+  const currentTime = getEnrollmentSortTime(current);
+  const nextTime = getEnrollmentSortTime(next);
+  if (nextTime !== currentTime) {
+    return nextTime > currentTime ? next : current;
+  }
+
+  const currentDeterministic = typeof current.docId === "string" && current.docId.includes("_");
+  const nextDeterministic = typeof next.docId === "string" && next.docId.includes("_");
+  if (currentDeterministic !== nextDeterministic) {
+    return nextDeterministic ? next : current;
+  }
+
+  return current;
+}
 
 export default function DashboardPage() {
 
@@ -67,7 +113,12 @@ export default function DashboardPage() {
             return { ...data, docId: docSnap.id, id: courseId };
           })
           .filter(Boolean);
-        setEnrolledCourses(records);
+        const deduped = new Map();
+        for (const entry of records) {
+          const previous = deduped.get(entry.id);
+          deduped.set(entry.id, choosePreferredEnrollment(previous, entry));
+        }
+        setEnrolledCourses(Array.from(deduped.values()));
       },
       (error) => {
         console.error("Failed to load enrollments", error);
@@ -452,13 +503,6 @@ export default function DashboardPage() {
       .filter(Boolean);
   }, [searchKeyword, enrichedEnrolledCourses]);
 
-  const paidCourses = useMemo(() => {
-    return enrichedEnrolledCourses.filter((course) => {
-      const enrollment = course.enrollment || {};
-      const status = typeof enrollment.status === "string" ? enrollment.status.toLowerCase() : "";
-      return enrollment.paymentStatus === "paid" || status === "paid";
-    });
-  }, [enrichedEnrolledCourses]);
 
   async function handleCreateRescheduleRequest(session, payload) {
     if (!sessionUser) return;
@@ -648,14 +692,6 @@ export default function DashboardPage() {
       description: "Review completion percentages and instructor milestones.",
       content: <StudentProgress enrolledCourses={enrichedEnrolledCourses} />,
     },
-    {
-      id: "payments",
-      label: "Payments",
-      badge: paidCourses.length ? `${paidCourses.length} paid` : "No payments",
-      title: "Payment records",
-      description: "View paid invoices and download receipts.",
-      content: <StudentPayments paidCourses={paidCourses} />,
-    },
   ];
 
   const activeTabDefinition =
@@ -691,6 +727,7 @@ export default function DashboardPage() {
       label: "Payments",
       description: "Receipts & history",
       icon: "💳",
+      href: "/student/payments",
     },
   ];
   const studentQuickLinks = [
@@ -771,6 +808,7 @@ export default function DashboardPage() {
           </SectionCard>
         </div>
       )}
+      <DashboardFooter />
     </main>
   );
 }
@@ -824,6 +862,127 @@ function PaymentNotice() {
       description={paymentBanner.message}
       actions={[]}
     />
+  );
+}
+
+function DashboardFooter() {
+  const footerColumns = [
+    {
+      title: "Piano Studio",
+      links: [
+        { label: "About us", href: "/Dashboard" },
+        { label: "Course catalog", href: "/Dashboard" },
+        { label: "Practice log", href: "/practice-log" },
+        { label: "Student payments", href: "/student/payments" },
+      ],
+    },
+    {
+      title: "Learning",
+      links: [
+        { label: "Courses", href: "/Dashboard" },
+        { label: "Materials", href: "/Dashboard" },
+        { label: "Attendance", href: "/Dashboard" },
+        { label: "Progress", href: "/Dashboard" },
+      ],
+    },
+    {
+      title: "Support",
+      links: [
+        { label: "Contact teacher", href: "/teacher/dashboard" },
+        { label: "Billing help", href: "/student/payments" },
+        { label: "Privacy", href: "#" },
+        { label: "Terms", href: "#" },
+      ],
+    },
+  ];
+
+  return (
+    <footer
+      style={{
+        maxWidth: "1200px",
+        margin: "32px auto 0",
+        borderTop: "1px solid rgba(203,213,225,0.8)",
+        paddingTop: "28px",
+        display: "grid",
+        gap: "24px",
+      }}
+    >
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gap: "20px",
+        }}
+      >
+        {footerColumns.map((column) => (
+          <section key={column.title} style={{ display: "grid", gap: "8px" }}>
+            <h3 style={{ margin: 0, fontSize: "18px", fontWeight: 700, color: "#0f172a" }}>
+              {column.title}
+            </h3>
+            <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "6px" }}>
+              {column.links.map((item) => (
+                <li key={item.label}>
+                  <Link
+                    href={item.href}
+                    style={{
+                      color: "#334155",
+                      fontSize: "14px",
+                      textDecoration: "none",
+                    }}
+                  >
+                    {item.label}
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          </section>
+        ))}
+      </div>
+
+      <div
+        style={{
+          borderTop: "1px solid rgba(226,232,240,0.9)",
+          paddingTop: "16px",
+          display: "flex",
+          flexWrap: "wrap",
+          justifyContent: "space-between",
+          gap: "10px",
+          color: "#64748b",
+          fontSize: "13px",
+        }}
+      >
+        <span>© 2026 Piano Studio. All rights reserved.</span>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+          <a href="https://www.facebook.com" target="_blank" rel="noreferrer" aria-label="Facebook">
+            <Image
+              src="/facebook.png"
+              alt="Facebook"
+              width={22}
+              height={22}
+              style={{ display: "block" }}
+            />
+          </a>
+          <a href="https://www.youtube.com" target="_blank" rel="noreferrer" aria-label="YouTube">
+            <Image
+              src="/Youtube.png"
+              alt="YouTube"
+              width={22}
+              height={22}
+              style={{ display: "block" }}
+            />
+          </a>
+          <a href="https://www.instagram.com" target="_blank" rel="noreferrer" aria-label="Instagram">
+            <Image
+              src="/instagram.jpg"
+              alt="Instagram"
+              width={22}
+              height={22}
+              style={{ display: "block" }}
+            />
+          </a>
+        </div>
+      </div>
+    </footer>
   );
 }
 
@@ -1063,23 +1222,34 @@ function StudentSidebar({
       <nav style={{ display: "grid", gap: "8px" }}>
         {primaryNav?.map((item) => {
           const isActive = item.id === activeTab;
+          const navStyle = {
+            width: "100%",
+            borderRadius: "14px",
+            border: isActive ? "2px solid #2563eb" : "1px solid rgba(226,232,240,0.8)",
+            backgroundColor: isActive ? "rgba(59,130,246,0.08)" : "white",
+            color: "#0f172a",
+            textAlign: "left",
+            padding: "12px",
+            display: "grid",
+            gap: "4px",
+            cursor: "pointer",
+          };
+          if (item.href) {
+            return (
+              <Link key={item.id} href={item.href} style={navStyle}>
+                <span style={{ fontSize: "13px", fontWeight: 600 }}>
+                  {item.icon} {item.label}
+                </span>
+                <span style={{ fontSize: "11px", color: "#64748b" }}>{item.description}</span>
+              </Link>
+            );
+          }
           return (
             <button
               key={item.id}
               type="button"
               onClick={() => onSelectTab?.(item.id)}
-              style={{
-                width: "100%",
-                borderRadius: "14px",
-                border: isActive ? "2px solid #2563eb" : "1px solid rgba(226,232,240,0.8)",
-                backgroundColor: isActive ? "rgba(59,130,246,0.08)" : "white",
-                color: "#0f172a",
-                textAlign: "left",
-                padding: "12px",
-                display: "grid",
-                gap: "4px",
-                cursor: "pointer",
-              }}
+              style={navStyle}
             >
               <span style={{ fontSize: "13px", fontWeight: 600 }}>
                 {item.icon} {item.label}
@@ -1303,15 +1473,19 @@ function StudentCourses({ courses, enrollmentById, searchActive }) {
   }
 
   return (
-    <div style={{ marginTop: "18px", display: "grid", gap: "18px" }}>
-      {courses.map((course) => {
-        const enrollment = enrollmentById.get(course.id);
-        const isEnrolled = Boolean(enrollment);
-        const statusLabel = enrollment?.status ?? (isEnrolled ? "Enrolled" : null);
-        const studentLabel = enrollment?.studentName ?? null;
-        const timeLabel = enrollment?.timeSlotLabel ?? "";
-        const quizScore =
-          typeof enrollment?.quizScore === "number" ? `Latest quiz: ${enrollment.quizScore}%` : null;
+      <div style={{ marginTop: "18px", display: "grid", gap: "18px" }}>
+        {courses.map((course) => {
+          const enrollment = enrollmentById.get(course.id);
+          const isEnrolled = Boolean(enrollment);
+          const isPaid = hasPaidAccess(enrollment);
+          const statusLabel = enrollment?.status ?? (isEnrolled ? "Enrolled" : null);
+          const studentLabel = enrollment?.studentName ?? null;
+          const timeLabel = enrollment?.timeSlotLabel ?? "";
+          const quizScore =
+            typeof enrollment?.quizScore === "number" ? `Latest quiz: ${enrollment.quizScore}%` : null;
+          const quizLockedLabel = isEnrolled
+            ? "Complete payment to unlock quiz"
+            : "Enroll to unlock quiz";
 
         const details = [];
         if (statusLabel) details.push(statusLabel);
@@ -1432,7 +1606,7 @@ function StudentCourses({ courses, enrollmentById, searchActive }) {
                   {isEnrolled ? "Manage Enrollment" : "View Details"}
                 </Link>
 
-                {course.quiz && isEnrolled && (
+                {course.quiz && isPaid && (
                   <Link
                     href={`/courses/${course.id}/quiz`}
                     style={{
@@ -1451,7 +1625,7 @@ function StudentCourses({ courses, enrollmentById, searchActive }) {
                   </Link>
                 )}
 
-                {course.quiz && !isEnrolled && (
+                {course.quiz && !isPaid && (
                   <span
                     style={{
                       display: "inline-flex",
@@ -1465,7 +1639,7 @@ function StudentCourses({ courses, enrollmentById, searchActive }) {
                       fontWeight: 600,
                     }}
                   >
-                    {"\uD83D\uDD12"} Enroll to unlock quiz
+                    {"\uD83D\uDD12"} {quizLockedLabel}
                   </span>
                 )}
               </div>
@@ -1552,6 +1726,43 @@ function StudentAttendance({
     return map;
   }, [rescheduleRequests]);
 
+  const meetingLinkByCourse = useMemo(() => {
+    const upcoming = [];
+    const past = [];
+    const nowTime = Date.now();
+
+    for (const session of lessonSessions || []) {
+      if (!session?.courseId) continue;
+      const rawLink = (session.meetingUrl || session.location || "").trim();
+      if (!rawLink) continue;
+      const sessionTime = session.date
+        ? new Date(`${session.date}T${session.startTime || "00:00"}`).getTime()
+        : NaN;
+      const entry = { courseId: session.courseId, link: rawLink, time: sessionTime };
+      if (Number.isNaN(sessionTime) || sessionTime >= nowTime) {
+        upcoming.push(entry);
+      } else {
+        past.push(entry);
+      }
+    }
+
+    upcoming.sort((a, b) => a.time - b.time);
+    past.sort((a, b) => b.time - a.time);
+
+    const map = new Map();
+    for (const item of upcoming) {
+      if (!map.has(item.courseId)) {
+        map.set(item.courseId, item.link);
+      }
+    }
+    for (const item of past) {
+      if (!map.has(item.courseId)) {
+        map.set(item.courseId, item.link);
+      }
+    }
+    return map;
+  }, [lessonSessions]);
+
   const statusStyles = {
     pending: { label: 'Pending', color: '#a855f7', background: '#f3e8ff' },
     present: { label: 'Present', color: '#15803d', background: '#dcfce7' },
@@ -1622,47 +1833,187 @@ function StudentAttendance({
     );
   }
 
-  if (!relevantSessions.length) {
-    return (
-      <p style={{ marginTop: '14px', fontSize: '13px', color: '#475569' }}>
-        No scheduled lessons yet. Your attendance records will appear here once sessions are scheduled.
-      </p>
-    );
-  }
+  const weeklySlots = enrolledCourses.map((course) => {
+    const enrollment = course.enrollment || {};
+    const isPaid = hasPaidAccess(enrollment);
+    const dayLabel = (enrollment.timeSlotDay || "").trim();
+    const startTime = (enrollment.timeSlotStartTime || "").trim();
+    const endTime = (enrollment.timeSlotEndTime || "").trim();
+    const slotLabel =
+      dayLabel && startTime && endTime
+        ? `${dayLabel} ${startTime} - ${endTime}`
+        : enrollment.timeSlotLabel || "Schedule pending";
+    const meetingLink =
+      (enrollment.meetingLink || "").trim() ||
+      meetingLinkByCourse.get(course.id) ||
+      "";
+    const joinDisabledReason = !isPaid
+      ? "Complete payment to join this class."
+      : meetingLink
+      ? ""
+      : "Meeting link pending from instructor.";
+    return {
+      id: course.id,
+      title: course.title,
+      teacher: course.teacher,
+      slotLabel,
+      meetingLink,
+      isPaid,
+      joinDisabledReason,
+    };
+  });
 
   return (
     <div style={{ marginTop: '18px', display: 'grid', gap: '16px' }}>
-      <div
+      <section
         style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          gap: '10px',
-          alignItems: 'center',
-          flexWrap: 'wrap',
+          borderRadius: "18px",
+          border: "1px solid rgba(226,232,240,0.7)",
+          padding: "18px",
+          backgroundColor: "white",
+          boxShadow: "0 12px 30px rgba(15,23,42,0.04)",
+          display: "grid",
+          gap: "14px",
         }}
       >
-        <span style={{ fontSize: '12px', color: '#94a3b8' }}>
-          {showPast ? 'Showing up to 90 days history.' : 'Showing upcoming & last 7 days.'}
-        </span>
-        <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
-          <button
-            type="button"
-            onClick={onToggleShowPast}
+        <div>
+          <h3 style={{ margin: 0, fontSize: "16px", fontWeight: 600, color: "#0f172a" }}>
+            Weekly class schedule
+          </h3>
+          <p style={{ marginTop: "6px", fontSize: "12px", color: "#64748b" }}>
+            Your fixed weekly slot and class link.
+          </p>
+        </div>
+        <div style={{ display: "grid", gap: "12px" }}>
+          {weeklySlots.map((slot) => (
+            <div
+              key={slot.id}
+              style={{
+                borderRadius: "14px",
+                border: "1px solid rgba(226,232,240,0.9)",
+                padding: "14px",
+                display: "grid",
+                gap: "10px",
+                backgroundColor: "#f8fafc",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: "12px",
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                <div>
+                  <p style={{ margin: 0, fontSize: "14px", fontWeight: 600, color: "#0f172a" }}>
+                    {slot.title}
+                  </p>
+                  <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#475569" }}>
+                    {slot.teacher ? `Instructor: ${slot.teacher}` : "Instructor pending"}
+                  </p>
+                </div>
+                <span
+                  style={{
+                    padding: "4px 12px",
+                    borderRadius: "999px",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    backgroundColor: "rgba(59,130,246,0.12)",
+                    color: "#1d4ed8",
+                  }}
+                >
+                  {slot.slotLabel}
+                </span>
+              </div>
+
+              <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
+                {slot.meetingLink && slot.isPaid ? (
+                  <a
+                    href={slot.meetingLink}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      padding: "8px 14px",
+                      borderRadius: "999px",
+                      border: "1px solid rgba(37,99,235,0.4)",
+                      backgroundColor: "rgba(37,99,235,0.12)",
+                      color: "#1d4ed8",
+                      textDecoration: "none",
+                      fontSize: "12px",
+                      fontWeight: 600,
+                    }}
+                  >
+                    Join class
+                  </a>
+                ) : (
+                  <button
+                    type="button"
+                    disabled
+                    style={{
+                      padding: "8px 14px",
+                      borderRadius: "999px",
+                      border: "1px solid rgba(148,163,184,0.5)",
+                      backgroundColor: "rgba(226,232,240,0.7)",
+                      color: "#94a3b8",
+                      fontSize: "12px",
+                      fontWeight: 600,
+                      cursor: "not-allowed",
+                    }}
+                  >
+                    Join class
+                  </button>
+                )}
+                {slot.joinDisabledReason ? (
+                  <span style={{ fontSize: "12px", color: "#b91c1c", fontWeight: 600 }}>
+                    {slot.joinDisabledReason}
+                  </span>
+                ) : (
+                  <span style={{ fontSize: "12px", color: "#64748b" }}>Link ready</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {relevantSessions.length ? (
+        <>
+          <div
             style={{
-              padding: '8px 14px',
-              borderRadius: '10px',
-              border: '1px solid rgba(148,163,184,0.4)',
-              backgroundColor: showPast ? 'rgba(59,130,246,0.1)' : 'white',
-              color: showPast ? '#1d4ed8' : '#0f172a',
-              fontSize: '12px',
-              fontWeight: 600,
-              cursor: 'pointer',
+              display: 'flex',
+              justifyContent: 'space-between',
+              gap: '10px',
+              alignItems: 'center',
+              flexWrap: 'wrap',
             }}
           >
-            {showPast ? 'Hide past sessions' : 'Show past sessions'}
-          </button>
-        </div>
-      </div>
+            <span style={{ fontSize: '12px', color: '#94a3b8' }}>
+              {showPast ? 'Showing up to 90 days history.' : 'Showing upcoming & last 7 days.'}
+            </span>
+            <div style={{ display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                onClick={onToggleShowPast}
+                style={{
+                  padding: '8px 14px',
+                  borderRadius: '10px',
+                  border: '1px solid rgba(148,163,184,0.4)',
+                  backgroundColor: showPast ? 'rgba(59,130,246,0.1)' : 'white',
+                  color: showPast ? '#1d4ed8' : '#0f172a',
+                  fontSize: '12px',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                }}
+              >
+                {showPast ? 'Hide past sessions' : 'Show past sessions'}
+              </button>
+            </div>
+          </div>
 
       {relevantSessions.map((session) => {
         const course = courseMap.get(session.courseId);
@@ -1939,6 +2290,12 @@ function StudentAttendance({
           </article>
         );
       })}
+        </>
+      ) : (
+        <p style={{ marginTop: "4px", fontSize: "13px", color: "#475569" }}>
+          No scheduled lessons yet. Your attendance records will appear here once sessions are scheduled.
+        </p>
+      )}
     </div>
   );
 }
@@ -1965,6 +2322,7 @@ function StudentMaterials({ enrolledCourses, hasEnrollments, searchActive }) {
     <div style={{ marginTop: "14px", display: "grid", gap: "18px" }}>
       {enrolledCourses.map((course) => {
         const resources = course.teacherMaterials || [];
+        const isPaid = hasPaidAccess(course.enrollment);
 
         return (
           <article
@@ -2048,14 +2406,20 @@ function StudentMaterials({ enrolledCourses, hasEnrollments, searchActive }) {
                         }}
                       >
                         <p style={{ fontSize: "13px", color: "#0f172a", fontWeight: 600, margin: 0 }}>
-                          <a
-                            href={item.url || "#"}
-                            target={item.url ? "_blank" : "_self"}
-                            rel="noreferrer"
-                            style={{ color: "#2563eb", textDecoration: "none" }}
-                          >
-                            {`${typeIcon} ${displayTitle}`}
-                          </a>
+                          {item.url && isPaid ? (
+                            <a
+                              href={item.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{ color: "#2563eb", textDecoration: "none" }}
+                            >
+                              {`${typeIcon} ${displayTitle}`}
+                            </a>
+                          ) : (
+                            <span style={{ color: isPaid ? "#0f172a" : "#94a3b8" }}>
+                              {`${typeIcon} ${displayTitle}`}
+                            </span>
+                          )}
                         </p>
                         <span
                           style={{
@@ -2082,6 +2446,11 @@ function StudentMaterials({ enrolledCourses, hasEnrollments, searchActive }) {
                           ? ` · Updated ${new Date(item.updatedAt).toLocaleDateString()}`
                           : ""}
                       </p>
+                      {!isPaid && (
+                        <span style={{ fontSize: "11px", color: "#b91c1c", fontWeight: 600 }}>
+                          Payment required to access.
+                        </span>
+                      )}
                     </li>
                   );
                 })}

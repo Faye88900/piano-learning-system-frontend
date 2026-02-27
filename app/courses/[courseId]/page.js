@@ -1,9 +1,9 @@
-"use client";
+﻿"use client";
 
 import Link from "next/link";
 import { use, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { collection, deleteDoc, doc, onSnapshot, orderBy, query, setDoc, where } from "firebase/firestore";
+import {collection,deleteDoc,doc,onSnapshot,orderBy,query,serverTimestamp,setDoc,where,} from "firebase/firestore";
 import { getCourseById } from "@/lib/courseCatalog";
 import { db } from "@/lib/firebase";
 import { useSessionUser } from "@/hooks/useSessionUser";
@@ -11,6 +11,64 @@ import { useSessionUser } from "@/hooks/useSessionUser";
 const paymentOptions = [
   { value: "pay_now", label: "Pay now (credit / debit card)", status: "Awaiting payment" },
 ];
+
+function hasPaidAccess(enrollment) {
+  if (!enrollment) return false;
+  const status = typeof enrollment.status === "string" ? enrollment.status.toLowerCase() : "";
+  return (
+    enrollment.paymentStatus === "paid" ||
+    status === "paid" ||
+    Boolean(enrollment.paidAt || enrollment.paymentReceiptUrl || enrollment.paymentIntentId)
+  );
+}
+
+function parseDurationToWeeks(duration) {
+  if (typeof duration !== "string") return 0;
+  const weekMatch = duration.match(/(\d+)\s*week/i);
+  if (weekMatch) return Number(weekMatch[1]) || 0;
+  const monthMatch = duration.match(/(\d+)\s*month/i);
+  if (monthMatch) return (Number(monthMatch[1]) || 0) * 4;
+  return 0;
+}
+
+function parseTimeToMinutes(value) {
+  if (typeof value !== "string" || !value.includes(":")) return null;
+  const [h, m] = value.split(":").map((part) => Number(part));
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
+  return h * 60 + m;
+}
+
+function getAverageSlotHours(timeSlots) {
+  if (!Array.isArray(timeSlots) || !timeSlots.length) return 1;
+  const durations = timeSlots
+    .map((slot) => {
+      const start = parseTimeToMinutes(slot?.startTime);
+      const end = parseTimeToMinutes(slot?.endTime);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+      return (end - start) / 60;
+    })
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (!durations.length) return 1;
+  return durations.reduce((sum, value) => sum + value, 0) / durations.length;
+}
+
+function buildFallbackSyllabus(course, averageSlotHours = 1) {
+  const objectives = Array.isArray(course?.objectives) ? course.objectives.filter(Boolean) : [];
+  if (!objectives.length) return [];
+
+  return objectives.map((objective, index) => {
+    const week = index + 1;
+    const liveHours = Math.max(1, Math.round(averageSlotHours * 10) / 10);
+    return {
+      id: `fallback-${course?.id || "course"}-${week}`,
+      weekLabel: `Week ${week}`,
+      title: objective,
+      duration: `${liveHours}h live + ${Math.max(2, liveHours + 1)}h practice`,
+      formats: ["Live lesson", "Guided practice", "Weekly assignment"],
+      practiceTask: `Practice focus: ${objective}`,
+    };
+  });
+}
 
 export default function CourseDetailPage({ params }) {
 
@@ -25,7 +83,14 @@ export default function CourseDetailPage({ params }) {
   const [paymentOption, setPaymentOption] = useState(paymentOptions[0].value);
   const [existingEnrollment, setExistingEnrollment] = useState(null);
   const [firestoreMaterials, setFirestoreMaterials] = useState([]);
+  const [courseEnrollmentRecords, setCourseEnrollmentRecords] = useState([]);
+  const [courseReviews, setCourseReviews] = useState([]);
+  const [myReview, setMyReview] = useState(null);
+  const [reviewRating, setReviewRating] = useState(0);
+  const [reviewComment, setReviewComment] = useState("");
+  const [submittingReview, setSubmittingReview] = useState(false);
   const [backHover, setBackHover] = useState(false);
+  const [openFaqIndex, setOpenFaqIndex] = useState(0);
 
   const [toast, setToast] = useState(null);
   const toastTimerRef = useRef(null);
@@ -40,7 +105,6 @@ export default function CourseDetailPage({ params }) {
     info: { background: "#1d4ed8", text: "#dbeafe", title: "Notice" },
   };
 
-  //用来显示提示讯息
   function showToast(nextToast) {
     setToast({ id: Date.now(), ...nextToast });
 
@@ -65,8 +129,6 @@ export default function CourseDetailPage({ params }) {
     }
   }, [sessionUser, loading, router]);
 
-  
-  //表单初始化
   useEffect(() => {
     if (!course || !sessionUser?.uid) {
       setExistingEnrollment(null);
@@ -141,6 +203,107 @@ export default function CourseDetailPage({ params }) {
     return () => unsubscribe();
   }, [course]);
 
+  useEffect(() => {
+    if (!course?.id) {
+      setCourseEnrollmentRecords([]);
+      return;
+    }
+
+    const enrollmentsQuery = query(
+      collection(db, "enrollments"),
+      where("courseId", "==", course.id)
+    );
+    const unsubscribe = onSnapshot(
+      enrollmentsQuery,
+      (snapshot) => {
+        const records = snapshot.docs.map((docSnap) => ({ docId: docSnap.id, ...docSnap.data() }));
+        setCourseEnrollmentRecords(records);
+      },
+      (error) => {
+        console.error("Failed to load course enrollments for trust signals", error);
+        setCourseEnrollmentRecords([]);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [course?.id]);
+
+  useEffect(() => {
+    if (!course?.id) {
+      setCourseReviews([]);
+      return;
+    }
+
+    const reviewsQuery = query(
+      collection(db, "courseReviews"),
+      where("courseId", "==", course.id)
+    );
+    const unsubscribe = onSnapshot(
+      reviewsQuery,
+      (snapshot) => {
+        const records = snapshot.docs.map((docSnap) => {
+          const data = docSnap.data();
+          const createdAt =
+            data.createdAt && typeof data.createdAt.toDate === "function"
+              ? data.createdAt.toDate().toISOString()
+              : data.createdAt ?? null;
+          const updatedAt =
+            data.updatedAt && typeof data.updatedAt.toDate === "function"
+              ? data.updatedAt.toDate().toISOString()
+              : data.updatedAt ?? null;
+          return {
+            docId: docSnap.id,
+            ...data,
+            createdAt,
+            updatedAt,
+          };
+        });
+        setCourseReviews(records);
+      },
+      (error) => {
+        console.error("Failed to load course reviews", error);
+        setCourseReviews([]);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [course?.id]);
+
+  useEffect(() => {
+    if (!course?.id || !sessionUser?.uid) {
+      setMyReview(null);
+      setReviewRating(0);
+      setReviewComment("");
+      return;
+    }
+
+    const reviewDocId = `${sessionUser.uid}_${course.id}`;
+    const reviewRef = doc(db, "courseReviews", reviewDocId);
+    const unsubscribe = onSnapshot(
+      reviewRef,
+      (snapshot) => {
+        if (!snapshot.exists()) {
+          setMyReview(null);
+          setReviewRating(0);
+          setReviewComment("");
+          return;
+        }
+        const data = snapshot.data();
+        setMyReview({ docId: snapshot.id, ...data });
+        setReviewRating(
+          typeof data.rating === "number" ? Math.max(1, Math.min(5, Math.round(data.rating))) : 0
+        );
+        setReviewComment(typeof data.comment === "string" ? data.comment : "");
+      },
+      (error) => {
+        console.error("Failed to load my course review", error);
+        setMyReview(null);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [course?.id, sessionUser?.uid]);
+
   const activeToastTheme = toast ? toastThemes[toast.type ?? "info"] : null;
 
   if (loading) {
@@ -196,8 +359,10 @@ export default function CourseDetailPage({ params }) {
 
   const isStudent = sessionUser?.role === "student";
   const isEnrolled = Boolean(existingEnrollment);
-  const isPaid =existingEnrollment?.paymentStatus === "paid" ||existingEnrollment?.status?.toLowerCase?.() === "paid";
-  const isPaymentPending =existingEnrollment?.paymentStatus === "pending" ||existingEnrollment?.status?.toLowerCase?.() === "awaiting payment";
+  const isPaid = hasPaidAccess(existingEnrollment);
+  const isPaymentPending =
+  existingEnrollment?.paymentStatus === "pending" ||
+  existingEnrollment?.status?.toLowerCase?.() === "awaiting payment";
   const selectedSlot = course.timeSlots?.find((slot) => slot.id === timeSlot) ?? null;
   const selectedPayment = paymentOptions.find((option) => option.value === paymentOption);
   const enrollmentDocId = sessionUser?.uid && course ? `${sessionUser.uid}_${course.id}` : null;
@@ -231,20 +396,39 @@ export default function CourseDetailPage({ params }) {
     }
 
     try {
-      await setDoc(doc(db, "enrollments", enrollmentDocId), {
-        courseId: course.id,
-        id: course.id,
-        courseTitle: course.title,
-        studentUid: sessionUser.uid,
-        studentEmail: sessionUser.email ?? "",
-        studentName: studentName.trim(),
-        timeSlot: selectedSlot?.id ?? "",
-        timeSlotLabel: selectedSlot?.label ?? "",
-        paymentOption,
-        paymentStatus: payNow ? "pending" : "not_required",
-        status: selectedPayment?.status ?? "Pending",
-        enrolledAt: new Date().toISOString(),
-      });
+      const nextPaymentStatus = isPaid
+        ? "paid"
+        : payNow
+        ? "pending"
+        : existingEnrollment?.paymentStatus ?? "not_required";
+      const nextStatus = isPaid
+        ? "Paid"
+        : payNow
+        ? selectedPayment?.status ?? "Awaiting payment"
+        : existingEnrollment?.status ?? "Pending";
+
+      await setDoc(
+        doc(db, "enrollments", enrollmentDocId),
+        {
+          courseId: course.id,
+          id: course.id,
+          courseTitle: course.title,
+          studentUid: sessionUser.uid,
+          studentEmail: sessionUser.email ?? "",
+          studentName: studentName.trim(),
+          timeSlot: selectedSlot?.id ?? "",
+          timeSlotLabel: selectedSlot?.label ?? "",
+          timeSlotDay: selectedSlot?.dayOfWeek ?? "",
+          timeSlotStartTime: selectedSlot?.startTime ?? "",
+          timeSlotEndTime: selectedSlot?.endTime ?? "",
+          paymentOption,
+          paymentStatus: nextPaymentStatus,
+          status: nextStatus,
+          meetingLink: existingEnrollment?.meetingLink ?? "",
+          enrolledAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
 
       if (isPaid) {
         showToast({
@@ -309,10 +493,197 @@ export default function CourseDetailPage({ params }) {
     }
   }
 
+  async function handleSubmitReview(event) {
+    event.preventDefault();
+    if (!sessionUser?.uid || !course?.id) {
+      showToast({ type: "error", message: "Please sign in before submitting a rating." });
+      return;
+    }
+    if (!isPaid) {
+      showToast({ type: "error", message: "Complete payment to rate this course." });
+      return;
+    }
+    if (!reviewRating || reviewRating < 1 || reviewRating > 5) {
+      showToast({ type: "error", message: "Please choose a rating between 1 and 5 stars." });
+      return;
+    }
+
+    setSubmittingReview(true);
+    const reviewDocId = `${sessionUser.uid}_${course.id}`;
+    try {
+      await setDoc(
+        doc(db, "courseReviews", reviewDocId),
+        {
+          courseId: course.id,
+          courseTitle: course.title,
+          studentUid: sessionUser.uid,
+          studentEmail: sessionUser.email ?? "",
+          studentName:
+            sessionUser.profileName ||
+            studentName?.trim() ||
+            sessionUser.email ||
+            "Student",
+          rating: reviewRating,
+          comment: reviewComment.trim(),
+          createdAt: myReview?.createdAt ?? serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+      showToast({
+        type: "success",
+        message: myReview ? "Your rating has been updated." : "Thanks for rating this course!",
+      });
+    } catch (error) {
+      console.error("Failed to save course review", error);
+      const isPermissionDenied = error?.code === "permission-denied";
+      showToast({
+        type: "error",
+        message: isPermissionDenied
+          ? "Course review write is blocked by Firestore rules. Please update and publish rules first."
+          : "Unable to save your rating. Please try again.",
+      });
+    } finally {
+      setSubmittingReview(false);
+    }
+  }
+
   const heroImage = course?.imageUrl ?? "";
   const teacherInitial = (course?.teacher?.[0] || "T").toUpperCase();
   const totalMaterials = firestoreMaterials.length;
   const scheduleOptionsCount = Array.isArray(course.timeSlots) ? course.timeSlots.length : 0;
+  const learnerCount = (() => {
+    const keys = new Set();
+    for (const entry of courseEnrollmentRecords) {
+      const key = entry?.studentUid || entry?.studentEmail || entry?.docId;
+      if (key) keys.add(key);
+    }
+    return keys.size;
+  })();
+  const normalizedRatings = courseReviews
+    .map((record) => Number(record?.rating))
+    .filter((value) => Number.isFinite(value) && value >= 1 && value <= 5);
+  const ratingCount = normalizedRatings.length;
+  const averageRating =
+    ratingCount > 0
+      ? Number(
+          (normalizedRatings.reduce((sum, value) => sum + value, 0) / ratingCount).toFixed(1)
+        )
+      : null;
+  const satisfactionRate =
+    ratingCount > 0
+      ? Math.round(
+          (normalizedRatings.filter((value) => value >= 4).length / ratingCount) * 100
+        )
+      : null;
+  const averageSlotHours = getAverageSlotHours(course?.timeSlots);
+  const totalHours = (() => {
+    const weeks = parseDurationToWeeks(course?.duration);
+    if (!weeks) return null;
+    const computed = weeks * averageSlotHours;
+    return Math.round(computed * 10) / 10;
+  })();
+  const trustSignals = [
+    {
+      label: "Rating",
+      value: averageRating ? `${averageRating} / 5` : "No ratings yet",
+      detail: `${ratingCount} review${ratingCount === 1 ? "" : "s"}`,
+    },
+    {
+      label: "Enrollments",
+      value: learnerCount ? `${learnerCount} learners` : "New course",
+      detail: learnerCount ? "Live count" : "Be among first learners",
+    },
+    {
+      label: "Satisfaction",
+      value: Number.isFinite(satisfactionRate) ? `${satisfactionRate}%` : "No ratings yet",
+      detail: ratingCount ? "4-5 star learner ratings" : "Submit first rating to unlock",
+    },
+    {
+      label: "Total hours",
+      value: totalHours ? `${totalHours} h` : "TBD",
+      detail: totalHours ? "Estimated guided time" : "Based on weekly schedule",
+    },
+  ];
+  const skillsYouGain = (() => {
+    const tags = Array.isArray(course?.tags) ? course.tags.filter(Boolean) : [];
+    if (tags.length) return tags.slice(0, 8);
+
+    const objectives = Array.isArray(course?.objectives)
+      ? course.objectives.filter(Boolean).slice(0, 6)
+      : [];
+    if (objectives.length) return objectives;
+
+    return ["Piano technique", "Sight reading", "Rhythm control", "Musical expression"];
+  })();
+  const detailsToKnow = [
+    { label: "Level", value: course?.level || "All levels" },
+    { label: "Duration", value: course?.duration || "Flexible" },
+    {
+      label: "Live schedule",
+      value: `${scheduleOptionsCount || 0} option${scheduleOptionsCount === 1 ? "" : "s"}`,
+    },
+    {
+      label: "Check-in quiz",
+      value: course?.quiz ? `${(course.quiz.questions || []).length} question(s)` : "Not included",
+    },
+    {
+      label: "Shared materials",
+      value: totalMaterials ? `${totalMaterials} resource(s)` : "Added by instructor over time",
+    },
+    {
+      label: "Tuition",
+      value: course?.tuition ? `$${course.tuition}` : "Contact studio",
+    },
+  ];
+  const syllabusModules = (
+    Array.isArray(course?.syllabus) && course.syllabus.length
+      ? course.syllabus
+      : buildFallbackSyllabus(course, averageSlotHours)
+  ).map((module, index) => ({
+    id: module?.id || `module-${index + 1}`,
+    weekLabel: module?.weekLabel || `Module ${index + 1}`,
+    title: module?.title || `Module ${index + 1}`,
+    duration: module?.duration || `${Math.round(averageSlotHours * 10) / 10}h live`,
+    formats: Array.isArray(module?.formats) ? module.formats.filter(Boolean) : [],
+    practiceTask: module?.practiceTask || "Practice this module and submit your weekly progress.",
+  }));
+  const faqItems = [
+    {
+      question: "How are lesson times arranged?",
+      answer:
+        scheduleOptionsCount > 0
+          ? `This course currently has ${scheduleOptionsCount} schedule option(s). Choose your preferred slot during enrollment, and you can review upcoming sessions from the Attendance tab in your dashboard.`
+          : "Lesson time is coordinated by your teacher after enrollment.",
+    },
+    {
+      question: "When do I get access to materials and quiz?",
+      answer:
+        "Course materials and the lesson check-in quiz are available after enrollment. Some resources are unlocked after payment is completed.",
+    },
+    {
+      question: "Can I request a make-up class?",
+      answer:
+        "Yes. If you cannot attend, use the Attendance section in your dashboard to submit a reschedule request with your preferred date and time.",
+    },
+    {
+      question: "What happens if payment is cancelled?",
+      answer:
+        "No charge is made. Your enrollment remains saved, and you can return to this page and retry checkout at any time.",
+    },
+    {
+      question: "Is this course suitable for my level?",
+      answer: `This class is marked as ${course?.level || "All levels"}. Check the learning objectives and skills section above to confirm it fits your current goals.`,
+    },
+  ];
+  const recentReviews = [...courseReviews]
+    .filter((record) => typeof record.comment === "string" && record.comment.trim())
+    .sort((a, b) => {
+      const aTime = new Date(a.updatedAt || a.createdAt || 0).getTime();
+      const bTime = new Date(b.updatedAt || b.createdAt || 0).getTime();
+      return bTime - aTime;
+    })
+    .slice(0, 3);
   const heroStats = [
     {
       label: "Tuition",
@@ -327,6 +698,131 @@ export default function CourseDetailPage({ params }) {
       value: `${totalMaterials} shared`,
     },
   ];
+
+  const studentRatingsSection = (
+<section
+              style={{
+                backgroundColor: "white",
+                borderRadius: "24px",
+                padding: "28px",
+                boxShadow: "0 18px 40px rgba(15, 23, 42, 0.08)",
+                display: "grid",
+                gap: "14px",
+              }}
+            >
+              <h2 style={{ fontSize: "22px", fontWeight: 600, color: "#0f172a" }}>
+                Student ratings
+              </h2>
+              <p style={{ margin: 0, fontSize: "13px", color: "#475569" }}>
+                {ratingCount
+                  ? `${ratingCount} learner rating${ratingCount > 1 ? "s" : ""} submitted`
+                  : "No ratings yet. Paid learners can submit the first review."}
+              </p>
+
+              <form onSubmit={handleSubmitReview} style={{ display: "grid", gap: "12px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  {[1, 2, 3, 4, 5].map((value) => {
+                    const active = reviewRating >= value;
+                    return (
+                      <button
+                        key={value}
+                        type="button"
+                        onClick={() => setReviewRating(value)}
+                        disabled={!isPaid}
+                        aria-label={`Rate ${value} star${value > 1 ? "s" : ""}`}
+                        style={{
+                          border: "none",
+                          background: "transparent",
+                          fontSize: "24px",
+                          lineHeight: 1,
+                          color: active ? "#f59e0b" : "#cbd5e1",
+                          cursor: isPaid ? "pointer" : "not-allowed",
+                          padding: 0,
+                        }}
+                      >
+                        {"\u2605"}
+                      </button>
+                    );
+                  })}
+                  <span style={{ fontSize: "13px", color: "#334155", marginLeft: "4px" }}>
+                    {reviewRating ? `${reviewRating}/5` : "Select rating"}
+                  </span>
+                </div>
+
+                <textarea
+                  rows={3}
+                  value={reviewComment}
+                  onChange={(event) => setReviewComment(event.target.value)}
+                  placeholder="Share a short review (optional)"
+                  disabled={!isPaid}
+                  style={{
+                    borderRadius: "12px",
+                    border: "1px solid rgba(148,163,184,0.4)",
+                    padding: "12px",
+                    fontSize: "13px",
+                    color: "#0f172a",
+                    backgroundColor: isPaid ? "white" : "rgba(248,250,252,0.8)",
+                    resize: "vertical",
+                  }}
+                />
+
+                <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+                  <button
+                    type="submit"
+                    disabled={!isPaid || submittingReview}
+                    style={{
+                      padding: "10px 16px",
+                      borderRadius: "12px",
+                      border: "none",
+                      background: !isPaid || submittingReview
+                        ? "#94a3b8"
+                        : "linear-gradient(120deg, #0ea5e9, #2563eb)",
+                      color: "white",
+                      fontWeight: 600,
+                      cursor: !isPaid || submittingReview ? "not-allowed" : "pointer",
+                    }}
+                  >
+                    {submittingReview ? "Saving..." : myReview ? "Update rating" : "Submit rating"}
+                  </button>
+                  {!isPaid && (
+                    <span style={{ fontSize: "12px", color: "#b45309" }}>
+                      Complete payment to rate this course.
+                    </span>
+                  )}
+                </div>
+              </form>
+
+              {recentReviews.length > 0 && (
+                <div style={{ display: "grid", gap: "10px", marginTop: "6px" }}>
+                  {recentReviews.map((item) => (
+                    <article
+                      key={item.docId}
+                      style={{
+                        border: "1px solid rgba(226,232,240,0.9)",
+                        borderRadius: "12px",
+                        padding: "12px",
+                        backgroundColor: "#f8fafc",
+                        display: "grid",
+                        gap: "6px",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: "10px" }}>
+                        <strong style={{ fontSize: "13px", color: "#0f172a" }}>
+                          {item.studentName || item.studentEmail || "Student"}
+                        </strong>
+                        <span style={{ fontSize: "12px", color: "#f59e0b", fontWeight: 700 }}>
+                          {"\u2605".repeat(Math.max(0, Math.min(5, Number(item.rating) || 0))) || "No rating"}
+                        </span>
+                      </div>
+                      <p style={{ margin: 0, fontSize: "13px", color: "#475569", lineHeight: 1.5 }}>
+                        {item.comment}
+                      </p>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </section>
+  );
 
   function scrollToEnrollmentCard() {
     if (typeof window === "undefined") return;
@@ -419,7 +915,6 @@ export default function CourseDetailPage({ params }) {
           onMouseEnter={() => setBackHover(true)}
           onMouseLeave={() => setBackHover(false)}
         >
-          <span style={{ fontSize: "14px" }}>←</span>
           <span>Back to dashboard</span>
         </Link>
 
@@ -524,6 +1019,41 @@ export default function CourseDetailPage({ params }) {
             <div
               style={{
                 display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                gap: "10px",
+              }}
+            >
+              {trustSignals.map((item) => (
+                <div
+                  key={item.label}
+                  style={{
+                    borderRadius: "14px",
+                    border: "1px solid rgba(148,163,184,0.3)",
+                    backgroundColor: "#f8fafc",
+                    padding: "10px 12px",
+                    display: "grid",
+                    gap: "4px",
+                  }}
+                >
+                  <span
+                    style={{
+                      fontSize: "11px",
+                      color: "#64748b",
+                      textTransform: "uppercase",
+                      letterSpacing: "0.08em",
+                    }}
+                  >
+                    {item.label}
+                  </span>
+                  <strong style={{ fontSize: "15px", color: "#0f172a" }}>{item.value}</strong>
+                  <span style={{ fontSize: "11px", color: "#94a3b8" }}>{item.detail}</span>
+                </div>
+              ))}
+            </div>
+
+            <div
+              style={{
+                display: "grid",
                 gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))",
                 gap: "12px",
               }}
@@ -602,6 +1132,210 @@ export default function CourseDetailPage({ params }) {
                 </div>
               ) : null}
             </section>
+        
+            <section
+            
+              style={{
+                backgroundColor: "white",
+                borderRadius: "24px",
+                padding: "28px",
+                boxShadow: "0 18px 40px rgba(15, 23, 42, 0.08)",
+                display: "grid",
+                gap: "18px",
+              }}
+            >
+              <h2 style={{ fontSize: "22px", fontWeight: 600, color: "#0f172a" }}>
+                What you&apos;ll gain
+              </h2>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+                  gap: "18px",
+                }}
+              >
+                <div
+                  style={{
+                    border: "1px solid rgba(148,163,184,0.28)",
+                    borderRadius: "18px",
+                    padding: "16px",
+                    backgroundColor: "#f8fafc",
+                    display: "grid",
+                    gap: "12px",
+                  }}
+                >
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "13px",
+                      fontWeight: 700,
+                      letterSpacing: "0.08em",
+                      color: "#0f172a",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    Skills you&apos;ll practice
+                  </h3>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                    {skillsYouGain.map((skill) => (
+                      <span
+                        key={skill}
+                        style={{
+                          padding: "7px 12px",
+                          borderRadius: "999px",
+                          fontSize: "12px",
+                          fontWeight: 600,
+                          color: "#1d4ed8",
+                          backgroundColor: "rgba(37,99,235,0.1)",
+                          border: "1px solid rgba(37,99,235,0.2)",
+                        }}
+                      >
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    border: "1px solid rgba(148,163,184,0.28)",
+                    borderRadius: "18px",
+                    padding: "16px",
+                    backgroundColor: "#f8fafc",
+                    display: "grid",
+                    gap: "10px",
+                  }}
+                >
+                  <h3
+                    style={{
+                      margin: 0,
+                      fontSize: "13px",
+                      fontWeight: 700,
+                      letterSpacing: "0.08em",
+                      color: "#0f172a",
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    Details to know
+                  </h3>
+                  <ul style={{ listStyle: "none", margin: 0, padding: 0, display: "grid", gap: "8px" }}>
+                    {detailsToKnow.map((item) => (
+                      <li
+                        key={item.label}
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          gap: "10px",
+                          borderBottom: "1px solid rgba(226,232,240,0.9)",
+                          paddingBottom: "8px",
+                          fontSize: "13px",
+                          color: "#334155",
+                        }}
+                      >
+                        <span>{item.label}</span>
+                        <strong style={{ color: "#0f172a", textAlign: "right" }}>{item.value}</strong>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </section>
+
+            <section
+              style={{
+                backgroundColor: "white",
+                borderRadius: "24px",
+                padding: "28px",
+                boxShadow: "0 18px 40px rgba(15, 23, 42, 0.08)",
+                display: "grid",
+                gap: "14px",
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", flexWrap: "wrap" }}>
+                <h2 style={{ fontSize: "22px", fontWeight: 600, color: "#0f172a" }}>
+                  Course syllabus
+                </h2>
+                <span
+                  style={{
+                    alignSelf: "center",
+                    fontSize: "12px",
+                    color: "#64748b",
+                    fontWeight: 600,
+                    letterSpacing: "0.04em",
+                  }}
+                >
+                  {syllabusModules.length} module{syllabusModules.length === 1 ? "" : "s"}
+                </span>
+              </div>
+              <p style={{ margin: 0, fontSize: "13px", color: "#475569" }}>
+                Follow this week-by-week path to track learning goals, lesson formats, and home practice tasks.
+              </p>
+
+              <div style={{ display: "grid", gap: "10px" }}>
+                {syllabusModules.map((module) => (
+                  <article
+                    key={module.id}
+                    style={{
+                      border: "1px solid rgba(203,213,225,0.9)",
+                      borderRadius: "14px",
+                      padding: "14px",
+                      backgroundColor: "#f8fafc",
+                      display: "grid",
+                      gap: "10px",
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
+                      <span
+                        style={{
+                          padding: "4px 10px",
+                          borderRadius: "999px",
+                          backgroundColor: "rgba(37,99,235,0.12)",
+                          color: "#1d4ed8",
+                          fontSize: "11px",
+                          fontWeight: 700,
+                          letterSpacing: "0.05em",
+                          textTransform: "uppercase",
+                        }}
+                      >
+                        {module.weekLabel}
+                      </span>
+                      <span style={{ fontSize: "12px", color: "#64748b", fontWeight: 600 }}>
+                        {module.duration}
+                      </span>
+                    </div>
+
+                    <h3 style={{ margin: 0, fontSize: "15px", color: "#0f172a", fontWeight: 600 }}>
+                      {module.title}
+                    </h3>
+
+                    {module.formats.length > 0 && (
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                        {module.formats.map((format) => (
+                          <span
+                            key={`${module.id}-${format}`}
+                            style={{
+                              padding: "5px 10px",
+                              borderRadius: "999px",
+                              border: "1px solid rgba(148,163,184,0.4)",
+                              backgroundColor: "white",
+                              fontSize: "11px",
+                              color: "#334155",
+                              fontWeight: 600,
+                            }}
+                          >
+                            {format}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    <p style={{ margin: 0, fontSize: "13px", lineHeight: 1.5, color: "#475569" }}>
+                      <strong style={{ color: "#0f172a" }}>Practice task:</strong> {module.practiceTask}
+                    </p>
+                  </article>
+                ))}
+              </div>
+            </section>
 
             <section
               style={{
@@ -642,7 +1376,7 @@ export default function CourseDetailPage({ params }) {
                         </span>
                       </div>
                       {item.url ? (
-                        isEnrolled ? (
+                        isPaid ? (
                           <a
                             href={item.url}
                             target="_blank"
@@ -671,7 +1405,7 @@ export default function CourseDetailPage({ params }) {
                               backgroundColor: "rgba(254,226,226,0.7)",
                             }}
                           >
-                            Enroll to access
+                            Payment required
                           </span>
                         )
                       ) : (
@@ -703,7 +1437,7 @@ export default function CourseDetailPage({ params }) {
                     alignItems: "center",
                   }}
                 >
-                  {existingEnrollment ? (
+                  {isPaid ? (
                     <Link
                       href={`/courses/${course.id}/quiz`}
                       style={{
@@ -718,12 +1452,18 @@ export default function CourseDetailPage({ params }) {
                         textDecoration: "none",
                       }}
                     >
-                      {existingEnrollment.quizScore !== undefined && existingEnrollment.quizScore !== null
+                      {existingEnrollment?.quizScore !== undefined && existingEnrollment?.quizScore !== null
                         ? "Retake quiz"
                         : "Start quiz"}
                     </Link>
+                  ) : isEnrolled ? (
+                    <span style={{ fontSize: "13px", color: "#b45309" }}>
+                      Complete payment to unlock this quiz.
+                    </span>
                   ) : (
-                    <span style={{ fontSize: "13px", color: "#94a3b8" }}>Enroll first to unlock this quiz.</span>
+                    <span style={{ fontSize: "13px", color: "#94a3b8" }}>
+                      Enroll first to unlock this quiz.
+                    </span>
                   )}
 
                   {existingEnrollment?.quizScore !== undefined && existingEnrollment.quizScore !== null && (
@@ -734,6 +1474,75 @@ export default function CourseDetailPage({ params }) {
                 </div>
               </section>
             )}
+
+            <section
+              style={{
+                backgroundColor: "white",
+                borderRadius: "24px",
+                padding: "28px",
+                boxShadow: "0 18px 40px rgba(15, 23, 42, 0.08)",
+                display: "grid",
+                gap: "14px",
+              }}
+            >
+              <h2 style={{ fontSize: "22px", fontWeight: 600, color: "#0f172a" }}>
+                Frequently asked questions
+              </h2>
+              <div style={{ display: "grid", gap: "10px" }}>
+                {faqItems.map((item, index) => {
+                  const isOpen = openFaqIndex === index;
+                  return (
+                    <article
+                      key={item.question}
+                      style={{
+                        border: "1px solid rgba(203,213,225,0.9)",
+                        borderRadius: "14px",
+                        backgroundColor: isOpen ? "rgba(59,130,246,0.06)" : "white",
+                        overflow: "hidden",
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setOpenFaqIndex((prev) => (prev === index ? -1 : index))}
+                        aria-expanded={isOpen}
+                        style={{
+                          width: "100%",
+                          border: "none",
+                          background: "transparent",
+                          cursor: "pointer",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          padding: "14px 16px",
+                          gap: "12px",
+                          textAlign: "left",
+                        }}
+                      >
+                        <span style={{ fontSize: "14px", fontWeight: 600, color: "#0f172a" }}>
+                          {item.question}
+                        </span>
+                        <span style={{ fontSize: "16px", color: "#1d4ed8", lineHeight: 1 }}>
+                          {isOpen ? "-" : "+"}
+                        </span>
+                      </button>
+                      {isOpen && (
+                        <p
+                          style={{
+                            margin: 0,
+                            padding: "0 16px 14px",
+                            fontSize: "13px",
+                            lineHeight: 1.6,
+                            color: "#475569",
+                          }}
+                        >
+                          {item.answer}
+                        </p>
+                      )}
+                    </article>
+                  );
+                })}
+              </div>
+            </section>
           </div>
 
           <div
@@ -881,6 +1690,7 @@ export default function CourseDetailPage({ params }) {
                       }}
                     >
                       Cancel enrollment
+                      
                     </button>
                   )}
                 </div>
@@ -954,6 +1764,7 @@ export default function CourseDetailPage({ params }) {
                 ))}
               </div>
             </section>
+            {studentRatingsSection}
           </div>
         </div>
       </div>

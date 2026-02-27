@@ -7,6 +7,16 @@ import { getCourseById } from "@/lib/courseCatalog";
 import { db } from "@/lib/firebase";
 import { useSessionUser } from "@/hooks/useSessionUser";
 
+function hasPaidAccess(enrollment) {
+  if (!enrollment) return false;
+  const status = typeof enrollment.status === "string" ? enrollment.status.toLowerCase() : "";
+  return (
+    enrollment.paymentStatus === "paid" ||
+    status === "paid" ||
+    Boolean(enrollment.paidAt || enrollment.paymentReceiptUrl || enrollment.paymentIntentId)
+  );
+}
+
 //初始化测试
 function getInitialAnswers(course) {
   if (!course?.quiz?.questions) return {};
@@ -159,6 +169,57 @@ export default function CourseQuizPage({ params }) {
           </h1>
           <p style={{ marginTop: "12px", color: "#475569" }}>
             Once you register, you can unlock the test and get your scores.
+          </p>
+          <Link
+            href={`/courses/${course.id}`}
+            style={{
+              display: "inline-flex",
+              marginTop: "18px",
+              padding: "10px 18px",
+              backgroundColor: "#0f172a",
+              color: "white",
+              fontWeight: 600,
+              borderRadius: "10px",
+              textDecoration: "none",
+            }}
+          >
+            Return to Course Introduction
+          </Link>
+        </div>
+      </main>
+    );
+  }
+
+  const isPaid = hasPaidAccess(enrollment);
+
+  if (!isPaid) {
+    return (
+      <main
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          backgroundColor: "#f8fafc",
+          fontFamily: "'Inter', 'Segoe UI', Arial, sans-serif",
+          padding: "20px",
+        }}
+      >
+        <div
+          style={{
+            maxWidth: "520px",
+            backgroundColor: "white",
+            borderRadius: "16px",
+            padding: "32px",
+            boxShadow: "0 10px 24px rgba(15, 23, 42, 0.08)",
+            textAlign: "center",
+          }}
+        >
+          <h1 style={{ fontSize: "26px", fontWeight: 700, color: "#0f172a" }}>
+            Payment required to unlock the quiz.
+          </h1>
+          <p style={{ marginTop: "12px", color: "#475569" }}>
+            Complete your payment to access this course quiz.
           </p>
           <Link
             href={`/courses/${course.id}`}

@@ -29,6 +29,9 @@ export default function TeacherDashboardPage() {
   const router = useRouter();
   const { sessionUser, loading } = useSessionUser();
   const [materials, setMaterials] = useState([]);
+  const [enrollments, setEnrollments] = useState([]);
+  const [meetingDrafts, setMeetingDrafts] = useState({});
+  const [savingMeetingId, setSavingMeetingId] = useState(null);
 
   const summary = useMemo(() => {
   const total = materials.length;
@@ -67,6 +70,61 @@ export default function TeacherDashboardPage() {
       router.push("/Dashboard");
     }
   }, [sessionUser, loading, router]);
+
+  useEffect(() => {
+    if (!sessionUser) {
+      setEnrollments([]);
+      return;
+    }
+
+    const enrollmentsQuery = query(
+      collection(db, "enrollments"),
+      orderBy("enrolledAt", "desc")
+    );
+
+    const unsubscribe = onSnapshot(
+      enrollmentsQuery,
+      (snapshot) => {
+        const records = snapshot.docs.map((docSnapshot) => {
+          const data = docSnapshot.data();
+          const enrolledAt =
+            data.enrolledAt && typeof data.enrolledAt.toDate === "function"
+              ? data.enrolledAt.toDate().toISOString()
+              : data.enrolledAt ?? null;
+          return {
+            docId: docSnapshot.id,
+            ...data,
+            enrolledAt,
+          };
+        });
+        setEnrollments(records);
+      },
+      (error) => {
+        console.error("Failed to load enrollments", error);
+        setEnrollments([]);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [sessionUser]);
+
+  async function handleSaveMeetingLink(enrollment) {
+    if (!enrollment?.docId) return;
+    const draft = (meetingDrafts[enrollment.docId] ?? enrollment.meetingLink ?? "").trim();
+    setSavingMeetingId(enrollment.docId);
+    try {
+      await updateDoc(doc(db, "enrollments", enrollment.docId), {
+        meetingLink: draft,
+        meetingLinkUpdatedAt: serverTimestamp(),
+        meetingLinkUpdatedBy: sessionUser?.email ?? "instructor",
+      });
+    } catch (error) {
+      console.error("Failed to update meeting link", error);
+      alert("Unable to save meeting link. Please try again.");
+    } finally {
+      setSavingMeetingId(null);
+    }
+  }
 
   //read-time material
   useEffect(() => {
@@ -638,6 +696,167 @@ export default function TeacherDashboardPage() {
                 {isUploading ? "Uploading..." : "Save resource"}
               </button>
             </form>
+          </section>
+
+          <section
+            style={{
+              borderRadius: "28px",
+              border: "1px solid rgba(203,213,225,0.6)",
+              backgroundColor: "white",
+              boxShadow: "0 25px 55px rgba(15,23,42,0.12)",
+              padding: "28px",
+              display: "grid",
+              gap: "18px",
+            }}
+          >
+            <div>
+              <p style={{ margin: 0, fontSize: "12px", letterSpacing: "0.12em", color: "#2563eb" }}>
+                CLASS LINKS
+              </p>
+              <h2 style={{ marginTop: "6px", fontSize: "22px", color: "#0f172a" }}>
+                Enrollment meeting links
+              </h2>
+              <p style={{ marginTop: "4px", fontSize: "13px", color: "#475569" }}>
+                Add the fixed online meeting link for each enrolled student.
+              </p>
+            </div>
+
+            {enrollments.length === 0 ? (
+              <p style={{ fontSize: "13px", color: "#475569" }}>
+                No enrollments found yet.
+              </p>
+            ) : (
+              <div style={{ display: "grid", gap: "14px" }}>
+                {enrollments.map((enrollment) => {
+                  const course = courseCatalog.find((item) => item.id === enrollment.courseId);
+                  const dayLabel = (enrollment.timeSlotDay || "").trim();
+                  const startTime = (enrollment.timeSlotStartTime || "").trim();
+                  const endTime = (enrollment.timeSlotEndTime || "").trim();
+                  const slotLabel =
+                    dayLabel && startTime && endTime
+                      ? `${dayLabel} ${startTime} - ${endTime}`
+                      : enrollment.timeSlotLabel || "Schedule pending";
+                  const meetingValue =
+                    meetingDrafts[enrollment.docId] ?? enrollment.meetingLink ?? "";
+                  const isSaving = savingMeetingId === enrollment.docId;
+
+                  return (
+                    <div
+                      key={enrollment.docId}
+                      style={{
+                        borderRadius: "18px",
+                        border: "1px solid rgba(226,232,240,0.8)",
+                        padding: "18px",
+                        backgroundColor: "#f8fafc",
+                        display: "grid",
+                        gap: "12px",
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          justifyContent: "space-between",
+                          flexWrap: "wrap",
+                          gap: "12px",
+                          alignItems: "center",
+                        }}
+                      >
+                        <div>
+                          <p style={{ margin: 0, fontSize: "14px", fontWeight: 600, color: "#0f172a" }}>
+                            {course?.title || enrollment.courseTitle || "Course"}
+                          </p>
+                          <p style={{ margin: "6px 0 0", fontSize: "12px", color: "#475569" }}>
+                            {enrollment.studentName || enrollment.studentEmail || "Student"}
+                          </p>
+                          <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#94a3b8" }}>
+                            Weekly slot: {slotLabel}
+                          </p>
+                        </div>
+                        <span
+                          style={{
+                            padding: "4px 12px",
+                            borderRadius: "999px",
+                            fontSize: "12px",
+                            fontWeight: 600,
+                            backgroundColor: "rgba(59,130,246,0.12)",
+                            color: "#1d4ed8",
+                          }}
+                        >
+                          {enrollment.paymentStatus === "paid" || enrollment.status === "Paid" ? "Paid" : "Pending"}
+                        </span>
+                      </div>
+
+                      <div style={{ display: "grid", gap: "10px" }}>
+                        <input
+                          type="url"
+                          value={meetingValue}
+                          onChange={(event) =>
+                            setMeetingDrafts((prev) => ({
+                              ...prev,
+                              [enrollment.docId]: event.target.value,
+                            }))
+                          }
+                          placeholder="https://meet.google.com/..."
+                          style={{
+                            padding: "12px 14px",
+                            borderRadius: "12px",
+                            border: "1px solid rgba(148,163,184,0.6)",
+                            backgroundColor: "white",
+                            color: "#0f172a",
+                            fontSize: "14px",
+                          }}
+                        />
+                        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                          <button
+                            type="button"
+                            onClick={() => handleSaveMeetingLink(enrollment)}
+                            disabled={isSaving}
+                            style={{
+                              padding: "10px 16px",
+                              borderRadius: "12px",
+                              border: "none",
+                              background: isSaving
+                                ? "linear-gradient(120deg, #94a3b8, #64748b)"
+                                : "linear-gradient(120deg, #2563eb, #1d4ed8)",
+                              color: "white",
+                              fontWeight: 600,
+                              cursor: isSaving ? "not-allowed" : "pointer",
+                              boxShadow: "0 12px 24px rgba(37,99,235,0.22)",
+                            }}
+                          >
+                            {isSaving ? "Saving..." : "Save link"}
+                          </button>
+                          {enrollment.meetingLink ? (
+                            <a
+                              href={enrollment.meetingLink}
+                              target="_blank"
+                              rel="noreferrer"
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                padding: "10px 16px",
+                                borderRadius: "12px",
+                                border: "1px solid rgba(37,99,235,0.4)",
+                                backgroundColor: "rgba(37,99,235,0.08)",
+                                color: "#1d4ed8",
+                                textDecoration: "none",
+                                fontWeight: 600,
+                              }}
+                            >
+                              Open link
+                            </a>
+                          ) : (
+                            <span style={{ fontSize: "12px", color: "#94a3b8" }}>
+                              No link saved yet.
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
         </div>
       </div>
