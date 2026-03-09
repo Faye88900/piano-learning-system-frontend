@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import {addDoc,collection,deleteDoc,doc,getDocs,onSnapshot,orderBy,query,serverTimestamp,setDoc,updateDoc,where,writeBatch,} from "firebase/firestore";
+import {addDoc,collection,deleteDoc,doc,onSnapshot,orderBy,query,serverTimestamp,setDoc,updateDoc,where,} from "firebase/firestore";
 import { courseCatalog } from "@/lib/courseCatalog";
 import { db } from "@/lib/firebase";
 import { useSessionUser } from "@/hooks/useSessionUser";
@@ -14,13 +14,104 @@ const attendanceStatuses = [
   { value: "excused", label: "Excused", color: "#0369a1", background: "#e0f2fe" },
 ];
 
+const WEEKDAY_TOKENS = [
+  ["sunday", 0],
+  ["sun", 0],
+  ["monday", 1],
+  ["mon", 1],
+  ["tuesday", 2],
+  ["tue", 2],
+  ["wednesday", 3],
+  ["wed", 3],
+  ["thursday", 4],
+  ["thu", 4],
+  ["friday", 5],
+  ["fri", 5],
+  ["saturday", 6],
+  ["sat", 6],
+];
+
+function parseWeekdayIndexes(dayLabel) {
+  const normalized = (dayLabel || "").toLowerCase();
+  if (!normalized) return [];
+  const indices = new Set();
+
+  if (normalized.includes("weekday")) {
+    [1, 2, 3, 4, 5].forEach((value) => indices.add(value));
+  }
+  if (normalized.includes("weekend")) {
+    [0, 6].forEach((value) => indices.add(value));
+  }
+  for (const [token, index] of WEEKDAY_TOKENS) {
+    if (normalized.includes(token)) {
+      indices.add(index);
+    }
+  }
+
+  return Array.from(indices);
+}
+
+function formatDateKey(dateValue) {
+  const year = dateValue.getFullYear();
+  const month = String(dateValue.getMonth() + 1).padStart(2, "0");
+  const day = String(dateValue.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function getNextSlotOccurrence(dayLabel, startTime) {
+  const weekdays = parseWeekdayIndexes(dayLabel);
+  if (!weekdays.length) return null;
+
+  const now = new Date();
+  const baseDate = new Date();
+  baseDate.setHours(0, 0, 0, 0);
+
+  const [hourPart, minutePart] = String(startTime || "00:00")
+    .split(":")
+    .map((value) => Number.parseInt(value, 10));
+  const hour = Number.isFinite(hourPart) ? hourPart : 0;
+  const minute = Number.isFinite(minutePart) ? minutePart : 0;
+
+  let bestOccurrence = null;
+  for (let offset = 0; offset < 14; offset += 1) {
+    const date = new Date(baseDate);
+    date.setDate(baseDate.getDate() + offset);
+    if (!weekdays.includes(date.getDay())) continue;
+
+    const dateTime = new Date(date);
+    dateTime.setHours(hour, minute, 0, 0);
+    if (dateTime.getTime() < now.getTime() - 60 * 1000) continue;
+
+    bestOccurrence = {
+      dateKey: formatDateKey(date),
+      dateTime,
+    };
+    break;
+  }
+
+  return bestOccurrence;
+}
+
+function hasPaidAccess(enrollment) {
+  return enrollment?.paymentStatus === "paid" || enrollment?.status === "Paid";
+}
+
+function formatSessionDateTime(session) {
+  if (!session?.date) return "Date TBA";
+  const parsed = new Date(`${session.date}T${session.startTime || "00:00"}`);
+  if (Number.isNaN(parsed.getTime())) {
+    return `${session.date}${session.startTime ? ` ${session.startTime}` : ""}`;
+  }
+  return parsed.toLocaleString();
+}
+
 export default function TeacherSchedulePage() {
 
   const router = useRouter();
   const { sessionUser, loading } = useSessionUser();
   const [sessions, setSessions] = useState([]);
+  const [enrollments, setEnrollments] = useState([]);
   const [attendanceRecords, setAttendanceRecords] = useState([]);
-  const [sessionStudents, setSessionStudents] = useState([]);
   const [selectedSessionId, setSelectedSessionId] = useState(null);
   const [formCourseId, setFormCourseId] = useState(courseCatalog[0]?.id ?? "");
   const [formTitle, setFormTitle] = useState("");
@@ -32,8 +123,8 @@ export default function TeacherSchedulePage() {
   const [rescheduleRequests, setRescheduleRequests] = useState([]);
   const [resolutionDrafts, setResolutionDrafts] = useState({});
   const [processingRequestId, setProcessingRequestId] = useState(null);
-  const [showResolvedRequests, setShowResolvedRequests] = useState(false);
   const [requestFilter, setRequestFilter] = useState("pending");
+  const [creatingFixedSessionKey, setCreatingFixedSessionKey] = useState(null);
 
   useEffect(() => {
     if (loading) return;
@@ -84,6 +175,43 @@ export default function TeacherSchedulePage() {
     return () => unsubscribe();
   }, [sessionUser]);
 
+  useEffect(() => {
+    if (!sessionUser) {
+      setEnrollments([]);
+      return;
+    }
+
+    const enrollmentsQuery = query(
+      collection(db, "enrollments"),
+      orderBy("enrolledAt", "desc")
+    );
+
+    const unsubscribe = onSnapshot(
+      enrollmentsQuery,
+      (snapshot) => {
+        const records = snapshot.docs.map((docSnapshot) => {
+          const data = docSnapshot.data();
+          const enrolledAt =
+            data.enrolledAt && typeof data.enrolledAt.toDate === "function"
+              ? data.enrolledAt.toDate().toISOString()
+              : data.enrolledAt ?? null;
+          return {
+            docId: docSnapshot.id,
+            ...data,
+            enrolledAt,
+          };
+        });
+        setEnrollments(records);
+      },
+      (error) => {
+        console.error("Failed to load enrollments", error);
+        setEnrollments([]);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [sessionUser]);
+
   //当老师选中一堂课时，实时读取并更新该堂课的点名
   useEffect(() => {
     if (!selectedSessionId) {
@@ -119,37 +247,6 @@ export default function TeacherSchedulePage() {
 
     return () => unsubscribe();
   }, [selectedSessionId]);
-
-  useEffect(() => {
-    const courseId = sessions.find((session) => session.id === selectedSessionId)?.courseId;
-    if (!courseId) {
-      setSessionStudents([]);
-      return;
-    }
-//找到所有报名这个课程的学生
-    const studentsQuery = query(collection(db, "enrollments"), where("courseId", "==", courseId));
-    const unsubscribe = onSnapshot(
-      studentsQuery,
-      (snapshot) => {
-        const students = snapshot.docs.map((docSnapshot) => {
-          const data = docSnapshot.data();
-          return {
-            id: docSnapshot.id,
-            studentUid: data.studentUid || "",
-            studentEmail: data.studentEmail || "",
-            studentName: data.studentName || data.studentEmail || "Student",
-          };
-        });
-        setSessionStudents(students);
-      },
-      (error) => {
-        console.error("Failed to load enrolled students", error);
-        setSessionStudents([]);
-      }
-    );
-
-    return () => unsubscribe();
-  }, [sessions, selectedSessionId]);
 
   //先把老师处理改课申请的资料存在前端
    function updateResolutionDraft(requestId, field, value) {
@@ -276,6 +373,7 @@ export default function TeacherSchedulePage() {
     today.setHours(0, 0, 0, 0);
 
     for (const session of sessions) {
+      if (session.archived) continue;
       const sessionDate = new Date(`${session.date}T${session.startTime || "00:00"}`);
       if (sessionDate >= today) {
         upcoming.push(session);
@@ -319,6 +417,74 @@ export default function TeacherSchedulePage() {
     return pendingRequests;
   }, [requestFilter, pendingRequests, resolvedRequests, rescheduleRequests]);
 
+  const paidEnrollments = useMemo(
+    () => (enrollments || []).filter((enrollment) => hasPaidAccess(enrollment)),
+    [enrollments]
+  );
+
+  const fixedWeeklySlots = useMemo(() => {
+    const grouped = new Map();
+
+    for (const enrollment of paidEnrollments) {
+      const courseId = enrollment.courseId || enrollment.id || "";
+      const course = courseCatalog.find((item) => item.id === courseId);
+      if (!courseId || !course) continue;
+
+      const dayLabel = (enrollment.timeSlotDay || "").trim();
+      const startTime = (enrollment.timeSlotStartTime || "").trim();
+      const endTime = (enrollment.timeSlotEndTime || "").trim();
+      const slotLabel =
+        dayLabel && startTime && endTime
+          ? `${dayLabel} ${startTime} - ${endTime}`
+          : (enrollment.timeSlotLabel || "").trim();
+      if (!slotLabel) continue;
+
+      const key = `${courseId}::${dayLabel}::${startTime}::${endTime}::${slotLabel}`;
+      const studentId = enrollment.studentUid || enrollment.studentEmail || enrollment.docId || "";
+      if (!studentId) continue;
+
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          key,
+          courseId,
+          courseTitle: course.title || enrollment.courseTitle || "Course",
+          courseLevel: course.level || "",
+          dayLabel,
+          startTime,
+          endTime,
+          slotLabel,
+          meetingLink: (enrollment.meetingLink || "").trim(),
+          students: [],
+          studentSet: new Set(),
+        });
+      }
+
+      const slot = grouped.get(key);
+      if (!slot.studentSet.has(studentId)) {
+        slot.studentSet.add(studentId);
+        slot.students.push({
+          studentUid: enrollment.studentUid || "",
+          studentEmail: enrollment.studentEmail || "",
+          studentName: enrollment.studentName || enrollment.studentEmail || "Student",
+        });
+      }
+      if (!slot.meetingLink && enrollment.meetingLink) {
+        slot.meetingLink = enrollment.meetingLink.trim();
+      }
+    }
+
+    return Array.from(grouped.values())
+      .map((slot) => ({
+        ...slot,
+        studentCount: slot.students.length,
+      }))
+      .sort((a, b) => {
+        const byCourse = (a.courseTitle || "").localeCompare(b.courseTitle || "");
+        if (byCourse !== 0) return byCourse;
+        return (a.slotLabel || "").localeCompare(b.slotLabel || "");
+      });
+  }, [paidEnrollments]);
+
   const summaryCounts = useMemo(() => {
     const upcomingCount = sessionsByDate.upcoming.length;
     const thisWeekCount = sessionsByDate.upcoming.filter((s) => {
@@ -333,6 +499,30 @@ export default function TeacherSchedulePage() {
     return { upcomingCount, thisWeekCount, requestCounts };
   }, [sessionsByDate.upcoming, pendingRequests, resolvedRequests]);
 
+  const nearestUpcomingSessionByCourse = useMemo(() => {
+    const map = new Map();
+    const nowTime = Date.now();
+    const cutoff = nowTime - 60 * 60 * 1000;
+
+    for (const session of sessions || []) {
+      if (session?.archived) continue;
+      if (!session?.courseId || !session?.date) continue;
+      const stamp = new Date(`${session.date}T${session.startTime || "00:00"}`).getTime();
+      if (Number.isNaN(stamp) || stamp < cutoff) continue;
+
+      const existing = map.get(session.courseId);
+      if (!existing || stamp < existing.stamp) {
+        map.set(session.courseId, { stamp, session });
+      }
+    }
+
+    const cleaned = new Map();
+    for (const [courseId, payload] of map.entries()) {
+      cleaned.set(courseId, payload.session);
+    }
+    return cleaned;
+  }, [sessions]);
+
 //当前选中的课程
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
@@ -340,14 +530,23 @@ export default function TeacherSchedulePage() {
   );
 
   const studentsForSelectedSession = useMemo(() => {
-    return sessionStudents
-      .map((entry) => ({
-        studentEmail: entry.studentEmail || "",
-        studentName: entry.studentName || entry.studentEmail || "Student",
-        studentUid: entry.studentUid || "",
-      }))
+    if (!selectedSession?.courseId) return [];
+
+    const grouped = new Map();
+    for (const enrollment of paidEnrollments) {
+      if ((enrollment.courseId || "") !== selectedSession.courseId) continue;
+      const identifier = enrollment.studentUid || enrollment.studentEmail || enrollment.docId || "";
+      if (!identifier || grouped.has(identifier)) continue;
+      grouped.set(identifier, {
+        studentEmail: enrollment.studentEmail || "",
+        studentName: enrollment.studentName || enrollment.studentEmail || "Student",
+        studentUid: enrollment.studentUid || "",
+      });
+    }
+
+    return Array.from(grouped.values())
       .sort((a, b) => (a.studentName || "").localeCompare(b.studentName || ""));
-  }, [sessionStudents]);
+  }, [paidEnrollments, selectedSession?.courseId]);
 
   function handleCreateSession(event) {
     event.preventDefault();
@@ -388,25 +587,81 @@ export default function TeacherSchedulePage() {
   }
 
   async function handleDeleteSession(sessionId) {
-    if (!confirm("Delete this session? Attendance records for this session will also be removed.")) {
+    if (!confirm("Remove this session from schedule?")) {
       return;
     }
 
     try {
       const sessionRef = doc(db, "sessions", sessionId);
-      const attendanceSnapshot = await getDocs(collection(sessionRef, "attendance"));
-      if (!attendanceSnapshot.empty) {
-        const batch = writeBatch(db);
-        attendanceSnapshot.forEach((docSnapshot) => batch.delete(docSnapshot.ref));
-        await batch.commit();
-      }
-      await deleteDoc(sessionRef);
+      await updateDoc(sessionRef, {
+        archived: true,
+        skipFixedRegeneration: false,
+        archivedAt: serverTimestamp(),
+        archivedBy: sessionUser?.email || "instructor",
+      });
       if (selectedSessionId === sessionId) {
         setSelectedSessionId(null);
       }
     } catch (error) {
       console.error("Failed to delete session", error);
       alert("Unable to delete this session right now.");
+    }
+  }
+
+  async function handleOpenFixedAttendance(slot) {
+    if (!sessionUser?.uid || !slot?.courseId) return;
+
+    setCreatingFixedSessionKey(slot.key);
+    try {
+      const scheduledSession = nearestUpcomingSessionByCourse.get(slot.courseId);
+      if (scheduledSession) {
+        setSelectedSessionId(scheduledSession.id);
+        return;
+      }
+
+      const occurrence = getNextSlotOccurrence(slot.dayLabel, slot.startTime);
+      if (!occurrence) {
+        alert("Unable to determine the next lesson date. Please check the weekly slot day format.");
+        return;
+      }
+
+      const existingSession = sessions.find((session) => {
+        if (session.archived) return false;
+        if ((session.courseId || "") !== slot.courseId) return false;
+        if ((session.date || "") !== occurrence.dateKey) return false;
+        if (!slot.startTime) return true;
+        return (session.startTime || "") === slot.startTime;
+      });
+
+      if (existingSession) {
+        setSelectedSessionId(existingSession.id);
+        return;
+      }
+
+      const course = courseCatalog.find((item) => item.id === slot.courseId);
+      const createdSession = await addDoc(collection(db, "sessions"), {
+        courseId: slot.courseId,
+        courseTitle: slot.courseTitle || course?.title || "",
+        courseLevel: slot.courseLevel || course?.level || "",
+        title: `${slot.courseTitle || course?.title || "Lesson"} Weekly Session`,
+        date: occurrence.dateKey,
+        startTime: slot.startTime || "",
+        endTime: slot.endTime || "",
+        location: slot.meetingLink || "",
+        notes: "Auto-created from fixed weekly slot for attendance tracking.",
+        source: "fixed_weekly_slot",
+        slotKey: slot.key,
+        teacherUid: sessionUser.uid,
+        teacherEmail: sessionUser.email || "",
+        createdAt: serverTimestamp(),
+      });
+
+      setSelectedSessionId(createdSession.id);
+    } catch (error) {
+      console.error("Failed to open fixed attendance session", error);
+      alert("Unable to open attendance for this weekly slot right now.");
+    } finally {
+      setCreatingFixedSessionKey(null);
     }
   }
 
@@ -436,24 +691,24 @@ export default function TeacherSchedulePage() {
     return null;
   }
 
-    return (
+  return (
     <main
       style={{
         minHeight: "100vh",
-        background: "radial-gradient(circle at top, #eef2ff 0%, #e0f2fe 40%, #f8fafc 100%)",
-        fontFamily: "'Inter', 'Segoe UI', Arial, sans-serif",
-        padding: "48px 24px",
+        background: "linear-gradient(180deg, #edf3ff 0%, #f8fbff 42%, #ffffff 100%)",
+        fontFamily: "'Manrope', 'Segoe UI', 'Trebuchet MS', sans-serif",
+        padding: "38px 20px 56px",
       }}
     >
       <section
         style={{
-          maxWidth: "1080px",
+          maxWidth: "1320px",
           margin: "0 auto",
-          borderRadius: "28px",
-          backgroundColor: "rgba(255,255,255,0.96)",
-          boxShadow: "0 28px 60px rgba(15, 23, 42, 0.18)",
-          border: "1px solid rgba(226,232,240,0.6)",
-          padding: "40px",
+          borderRadius: "26px",
+          backgroundColor: "rgba(255,255,255,0.98)",
+          boxShadow: "0 24px 70px rgba(15, 23, 42, 0.12)",
+          border: "1px solid rgba(203,213,225,0.65)",
+          padding: "34px",
           display: "grid",
           gap: "24px",
         }}
@@ -471,29 +726,31 @@ export default function TeacherSchedulePage() {
             <p
               style={{
                 display: "inline-flex",
-                padding: "6px 16px",
+                padding: "7px 14px",
                 borderRadius: "999px",
-                backgroundColor: "rgba(59,130,246,0.15)",
-                color: "#1d4ed8",
-                fontSize: "12px",
+                backgroundColor: "rgba(14,116,144,0.13)",
+                color: "#0e7490",
+                fontSize: "11px",
                 fontWeight: 600,
-                letterSpacing: "0.16em",
+                letterSpacing: "0.15em",
               }}
             >
               SCHEDULE & ATTENDANCE
             </p>
             <h1
               style={{
-                marginTop: "18px",
-                fontSize: "30px",
-                fontWeight: 700,
+                marginTop: "14px",
+                fontSize: "38px",
+                lineHeight: 1.15,
+                fontWeight: 800,
                 color: "#0f172a",
               }}
             >
               Manage lesson schedule and attendance
             </h1>
-            <p style={{ marginTop: "8px", color: "#475569", fontSize: "14px" }}>
-              Create sessions, track attendance, and keep a pulse on student participation.
+            <p style={{ marginTop: "10px", color: "#334155", fontSize: "15px", maxWidth: "760px" }}>
+              Keep your teaching week clean and actionable: publish sessions, handle reschedules, and mark
+              attendance from one place.
             </p>
           </div>
           <Link
@@ -502,8 +759,8 @@ export default function TeacherSchedulePage() {
               display: "inline-flex",
               alignItems: "center",
               gap: "8px",
-              padding: "10px 16px",
-              borderRadius: "10px",
+              padding: "10px 15px",
+              borderRadius: "12px",
               border: "1px solid rgba(148,163,184,0.5)",
               color: "#0f172a",
               fontWeight: 600,
@@ -514,12 +771,47 @@ export default function TeacherSchedulePage() {
           </Link>
         </header>
 
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "10px",
+          }}
+        >
+          {[
+            { href: "#create-session", label: "Create Session" },
+            { href: "#fixed-slots", label: "Fixed Slots" },
+            { href: "#upcoming-sessions", label: "Upcoming" },
+            { href: "#attendance-panel", label: "Attendance" },
+            { href: "#reschedule-requests", label: "Requests" },
+          ].map((item) => (
+            <a
+              key={item.href}
+              href={item.href}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                padding: "7px 12px",
+                borderRadius: "999px",
+                fontSize: "12px",
+                fontWeight: 600,
+                color: "#334155",
+                textDecoration: "none",
+                border: "1px solid rgba(148,163,184,0.35)",
+                backgroundColor: "white",
+              }}
+            >
+              {item.label}
+            </a>
+          ))}
+        </div>
+
         {/* 两列布局：左主体，右侧粘性概要/待办 */}
         <div
           style={{
             display: "grid",
-            gridTemplateColumns: "minmax(0, 2fr) minmax(320px, 1fr)",
-            gap: "18px",
+            gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))",
+            gap: "20px",
             alignItems: "start",
           }}
         >
@@ -527,22 +819,30 @@ export default function TeacherSchedulePage() {
           <div style={{ display: "grid", gap: "18px" }}>
             {/* 创建会话表单 */}
             <section
+              id="create-session"
               style={{
-                borderRadius: "18px",
+                borderRadius: "20px",
                 border: "1px solid rgba(226,232,240,0.7)",
                 padding: "24px",
                 backgroundColor: "white",
                 display: "grid",
-                gap: "16px",
+                gap: "14px",
               }}
             >
-              <h2 style={{ fontSize: "18px", fontWeight: 600, color: "#0f172a" }}>Create a lesson session</h2>
+              <div>
+                <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
+                  PUBLISH LESSON
+                </p>
+                <h2 style={{ margin: "6px 0 0", fontSize: "22px", fontWeight: 700, color: "#0f172a" }}>
+                  Create a lesson session
+                </h2>
+              </div>
              <form
                     onSubmit={handleCreateSession}
                     style={{
                     display: "grid",
                     gap: "14px",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))",
                   }}
                 >
                   <label
@@ -562,6 +862,9 @@ export default function TeacherSchedulePage() {
                         padding: "10px 12px",
                         borderRadius: "10px",
                         border: "1px solid #cbd5f5",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        colorScheme: "light",
                         fontSize: "14px",
                       }}
                     >
@@ -592,6 +895,9 @@ export default function TeacherSchedulePage() {
                         padding: "10px 12px",
                         borderRadius: "10px",
                         border: "1px solid #cbd5f5",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        colorScheme: "light",
                         fontSize: "14px",
                       }}
                     />
@@ -615,6 +921,9 @@ export default function TeacherSchedulePage() {
                         padding: "10px 12px",
                         borderRadius: "10px",
                         border: "1px solid #cbd5f5",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        colorScheme: "light",
                         fontSize: "14px",
                       }}
                     />
@@ -638,6 +947,9 @@ export default function TeacherSchedulePage() {
                         padding: "10px 12px",
                         borderRadius: "10px",
                         border: "1px solid #cbd5f5",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        colorScheme: "light",
                         fontSize: "14px",
                       }}
                     />
@@ -661,6 +973,9 @@ export default function TeacherSchedulePage() {
                         padding: "10px 12px",
                         borderRadius: "10px",
                         border: "1px solid #cbd5f5",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        colorScheme: "light",
                         fontSize: "14px",
                       }}
                     />
@@ -685,6 +1000,9 @@ export default function TeacherSchedulePage() {
                         padding: "10px 12px",
                         borderRadius: "10px",
                         border: "1px solid #cbd5f5",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        colorScheme: "light",
                         fontSize: "14px",
                       }}
                     />
@@ -710,6 +1028,9 @@ export default function TeacherSchedulePage() {
                         padding: "10px 12px",
                         borderRadius: "10px",
                         border: "1px solid #cbd5f5",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        colorScheme: "light",
                         fontSize: "14px",
                         resize: "vertical",
                       }}
@@ -735,11 +1056,127 @@ export default function TeacherSchedulePage() {
         </div>
       </form>
             </section>
+
+            {fixedWeeklySlots.length > 0 && (
+              <section
+                id="fixed-slots"
+                style={{
+                  borderRadius: "20px",
+                  border: "1px solid rgba(226,232,240,0.7)",
+                  padding: "18px",
+                  backgroundColor: "white",
+                  display: "grid",
+                  gap: "12px",
+                }}
+              >
+                <header style={{ display: "grid", gap: "4px" }}>
+                  <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
+                    RECURRING CLASSES
+                  </p>
+                  <h3 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
+                    Fixed weekly slots
+                  </h3>
+                  <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>
+                    Use this to mark attendance for regular classes. A session is auto-created if needed.
+                  </p>
+                </header>
+
+                <div style={{ display: "grid", gap: "10px" }}>
+                  {fixedWeeklySlots.map((slot) => {
+                    const nextOccurrence = getNextSlotOccurrence(slot.dayLabel, slot.startTime);
+                    const scheduledSession = nearestUpcomingSessionByCourse.get(slot.courseId) || null;
+                    const matchingSession = nextOccurrence
+                      ? sessions.find((session) => {
+                          if (session.archived) return false;
+                          if ((session.courseId || "") !== slot.courseId) return false;
+                          if ((session.date || "") !== nextOccurrence.dateKey) return false;
+                          if (!slot.startTime) return true;
+                          return (session.startTime || "") === slot.startTime;
+                        })
+                      : null;
+                    const usingScheduledSession =
+                      !!scheduledSession && (!matchingSession || scheduledSession.id !== matchingSession.id);
+                    const isCreating = creatingFixedSessionKey === slot.key;
+
+                    return (
+                      <article
+                        key={slot.key}
+                        style={{
+                          borderRadius: "14px",
+                          border: "1px solid rgba(226,232,240,0.9)",
+                          padding: "14px",
+                          backgroundColor: "#f8fafc",
+                          display: "grid",
+                          gap: "10px",
+                        }}
+                      >
+                        <div
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            alignItems: "center",
+                            gap: "10px",
+                            flexWrap: "wrap",
+                          }}
+                        >
+                          <div>
+                            <p style={{ margin: 0, fontSize: "14px", fontWeight: 600, color: "#0f172a" }}>
+                              {slot.courseTitle}
+                            </p>
+                            <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#475569" }}>
+                              {slot.slotLabel}
+                            </p>
+                            <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#94a3b8" }}>
+                              {slot.studentCount} paid student{slot.studentCount > 1 ? "s" : ""} enrolled
+                            </p>
+                            {nextOccurrence && (
+                              <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#64748b" }}>
+                                Next class: {nextOccurrence.dateTime.toLocaleString()}
+                              </p>
+                            )}
+                            {usingScheduledSession && (
+                              <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#0f766e" }}>
+                                Scheduled session will open: {formatSessionDateTime(scheduledSession)}
+                              </p>
+                            )}
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => handleOpenFixedAttendance(slot)}
+                            disabled={isCreating}
+                            style={{
+                              padding: "8px 14px",
+                              borderRadius: "10px",
+                              border: "1px solid rgba(34,197,94,0.4)",
+                              backgroundColor: "white",
+                              color: "#15803d",
+                              fontWeight: 600,
+                              cursor: isCreating ? "not-allowed" : "pointer",
+                              opacity: isCreating ? 0.6 : 1,
+                            }}
+                          >
+                            {isCreating
+                              ? "Opening..."
+                              : usingScheduledSession
+                              ? "Open scheduled session"
+                              : matchingSession
+                              ? "Open attendance"
+                              : "Create next fixed session"}
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
+            )}
             {/* 即将到来 / 历史会话列表 */}
             {sessionsByDate.upcoming.length > 0 && (
               <section
+                id="upcoming-sessions"
                 style={{
-                  borderRadius: "18px",
+                  borderRadius: "20px",
                   border: "1px solid rgba(226,232,240,0.7)",
                   padding: "18px",
                   backgroundColor: "white",
@@ -749,7 +1186,10 @@ export default function TeacherSchedulePage() {
               >
                 <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
                   <div>
-                    <h3 style={{ margin: 0, fontSize: "16px", fontWeight: 700, color: "#0f172a" }}>Upcoming sessions</h3>
+                    <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
+                      SESSION QUEUE
+                    </p>
+                    <h3 style={{ margin: "4px 0 0", fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>Upcoming sessions</h3>
                     <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>Next lessons you have scheduled.</p>
                   </div>
                 </header>
@@ -770,7 +1210,7 @@ export default function TeacherSchedulePage() {
             {sessionsByDate.past.length > 0 && (
               <section
                 style={{
-                  borderRadius: "18px",
+                  borderRadius: "20px",
                   border: "1px solid rgba(226,232,240,0.7)",
                   padding: "18px",
                   backgroundColor: "white",
@@ -780,7 +1220,7 @@ export default function TeacherSchedulePage() {
               >
                 <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
                   <div>
-                    <h3 style={{ margin: 0, fontSize: "16px", fontWeight: 700, color: "#0f172a" }}>Past sessions</h3>
+                    <h3 style={{ margin: 0, fontSize: "18px", fontWeight: 700, color: "#0f172a" }}>Past sessions</h3>
                     <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>Recent lessons already completed.</p>
                   </div>
                 </header>
@@ -801,8 +1241,9 @@ export default function TeacherSchedulePage() {
             {/* 出勤面板（若选中某会话） */}
            {selectedSession && (
                  <section
+                id="attendance-panel"
                 style={{
-                  borderRadius: "18px",
+                  borderRadius: "20px",
                   border: "1px solid rgba(226,232,240,0.7)",
                   padding: "24px",
                   backgroundColor: "white",
@@ -821,8 +1262,8 @@ export default function TeacherSchedulePage() {
                   <div>
                     <h2
                       style={{
-                        fontSize: "18px",
-                        fontWeight: 600,
+                        fontSize: "22px",
+                        fontWeight: 700,
                         color: "#0f172a",
                       }}
                     >
@@ -993,6 +1434,9 @@ export default function TeacherSchedulePage() {
                                 padding: "10px 12px",
                                 borderRadius: "10px",
                                 border: "1px solid #cbd5f5",
+                                backgroundColor: "white",
+                                color: "#0f172a",
+                                colorScheme: "light",
                                 fontSize: "13px",
                                 resize: "vertical",
                               }}
@@ -1024,17 +1468,16 @@ export default function TeacherSchedulePage() {
                    <aside
             style={{
               display: "grid",
-              gap: "12px",
-              position: "sticky",
-              top: "24px",
+              gap: "16px",
+              alignContent: "start",
             }}
           >
             {/* This week at a glance */}
             <div
               style={{
-                borderRadius: "16px",
+                borderRadius: "20px",
                 border: "1px solid rgba(226,232,240,0.8)",
-                padding: "16px",
+                padding: "18px",
                 backgroundColor: "white",
                 boxShadow: "0 12px 28px rgba(15,23,42,0.1)",
                 display: "grid",
@@ -1044,7 +1487,7 @@ export default function TeacherSchedulePage() {
               <p style={{ margin: 0, fontSize: "13px", fontWeight: 700, color: "#0f172a" }}>
                 This week at a glance
               </p>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: "8px" }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
                 <div style={{ padding: "10px", borderRadius: "10px", background: "rgba(59,130,246,0.08)" }}>
                   <p style={{ margin: 0, fontSize: "11px", color: "#2563eb", fontWeight: 700 }}>Upcoming</p>
                   <p style={{ margin: "4px 0 0", fontSize: "22px", fontWeight: 800, color: "#0f172a" }}>
@@ -1063,15 +1506,22 @@ export default function TeacherSchedulePage() {
                     {pendingRequests.length}
                   </p>
                 </div>
+                <div style={{ padding: "10px", borderRadius: "10px", background: "rgba(14,165,233,0.08)" }}>
+                  <p style={{ margin: 0, fontSize: "11px", color: "#0369a1", fontWeight: 700 }}>Weekly slots</p>
+                  <p style={{ margin: "4px 0 0", fontSize: "22px", fontWeight: 800, color: "#0f172a" }}>
+                    {fixedWeeklySlots.length}
+                  </p>
+                </div>
               </div>
             </div>
 
             {/* Reschedule requests */}
             <section
+              id="reschedule-requests"
               style={{
-                borderRadius: "16px",
+                borderRadius: "20px",
                 border: "1px solid rgba(226,232,240,0.7)",
-                padding: "16px",
+                padding: "18px",
                 backgroundColor: "white",
                 display: "grid",
                 gap: "12px",
@@ -1087,37 +1537,59 @@ export default function TeacherSchedulePage() {
                 }}
               >
                 <div>
-                  <h2 style={{ fontSize: "18px", fontWeight: 600, color: "#0f172a" }}>Reschedule requests</h2>
+                  <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
+                    REQUEST INBOX
+                  </p>
+                  <h2 style={{ fontSize: "22px", fontWeight: 700, color: "#0f172a", marginTop: "4px" }}>Reschedule requests</h2>
                   <p style={{ fontSize: "13px", color: "#475569", marginTop: "4px" }}>
                     Review make-up lesson requests submitted by students.
                   </p>
                 </div>
-                {resolvedRequests.length > 0 && (
+              </header>
+
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                {[
+                  { key: "pending", label: `Pending (${pendingRequests.length})` },
+                  { key: "all", label: `All (${rescheduleRequests.length})` },
+                  { key: "resolved", label: `Resolved (${resolvedRequests.length})` },
+                ].map((option) => (
                   <button
+                    key={option.key}
                     type="button"
-                    onClick={() => setShowResolvedRequests((prev) => !prev)}
+                    onClick={() => setRequestFilter(option.key)}
                     style={{
-                      padding: "6px 12px",
+                      padding: "6px 11px",
                       borderRadius: "999px",
-                      border: "1px solid rgba(148,163,184,0.4)",
-                      backgroundColor: "white",
-                      color: "#475569",
+                      border:
+                        requestFilter === option.key
+                          ? "1px solid rgba(14,165,233,0.45)"
+                          : "1px solid rgba(148,163,184,0.35)",
+                      backgroundColor: requestFilter === option.key ? "rgba(224,242,254,0.8)" : "white",
+                      color: requestFilter === option.key ? "#0369a1" : "#475569",
                       fontSize: "12px",
                       fontWeight: 600,
                       cursor: "pointer",
                     }}
                   >
-                    {showResolvedRequests ? "Hide resolved" : `Show resolved (${resolvedRequests.length})`}
+                    {option.label}
                   </button>
-                )}
-              </header>
+                ))}
+              </div>
 
-              {!pendingRequests.length ? (
-                <p style={{ fontSize: "13px", color: "#475569" }}>No pending requests at the moment.</p>
+              {!filteredRequests.length ? (
+                <p style={{ fontSize: "13px", color: "#475569" }}>
+                  {requestFilter === "pending"
+                    ? "No pending requests at the moment."
+                    : requestFilter === "resolved"
+                    ? "No resolved requests yet."
+                    : "No requests found."}
+                </p>
               ) : (
-                pendingRequests.map((request) => {
+                <div style={{ display: "grid", gap: "12px", maxHeight: "900px", overflowY: "auto", paddingRight: "2px" }}>
+                {filteredRequests.map((request) => {
                   const draft = resolutionDrafts[request.id] || {};
                   const isProcessing = processingRequestId === request.id;
+                  const isPending = request.status === "pending";
                   const statusColors = {
                     pending: { color: "#a855f7", background: "#f3e8ff" },
                     approved: { color: "#15803d", background: "#dcfce7" },
@@ -1184,7 +1656,7 @@ export default function TeacherSchedulePage() {
                         </span>
                       </div>
 
-                      {request.status === "pending" ? (
+                      {isPending ? (
                         <form style={{ display: "grid", gap: "10px" }}>
                           <div
                             style={{
@@ -1203,6 +1675,9 @@ export default function TeacherSchedulePage() {
                                   padding: "8px 10px",
                                   borderRadius: "10px",
                                   border: "1px solid #cbd5f5",
+                                  backgroundColor: "white",
+                                  color: "#0f172a",
+                                  colorScheme: "light",
                                   fontSize: "13px",
                                 }}
                               />
@@ -1217,6 +1692,9 @@ export default function TeacherSchedulePage() {
                                   padding: "8px 10px",
                                   borderRadius: "10px",
                                   border: "1px solid #cbd5f5",
+                                  backgroundColor: "white",
+                                  color: "#0f172a",
+                                  colorScheme: "light",
                                   fontSize: "13px",
                                 }}
                               />
@@ -1234,6 +1712,9 @@ export default function TeacherSchedulePage() {
                                 padding: "10px 12px",
                                 borderRadius: "10px",
                                 border: "1px solid #cbd5f5",
+                                backgroundColor: "white",
+                                color: "#0f172a",
+                                colorScheme: "light",
                                 fontSize: "13px",
                                 resize: "vertical",
                               }}
@@ -1282,70 +1763,8 @@ export default function TeacherSchedulePage() {
                           {request.resolutionNote ? ` · Note: ${request.resolutionNote}` : ""}
                         </p>
                       )}
-                    </article>
-                  );
-                })
-              )}
 
-              {showResolvedRequests && resolvedRequests.length > 0 && (
-                <div style={{ marginTop: "4px", display: "grid", gap: "12px" }}>
-                  {resolvedRequests.map((request) => {
-                    const statusColors = {
-                      approved: { color: "#15803d", background: "#dcfce7" },
-                      rejected: { color: "#b91c1c", background: "#fee2e2" },
-                    };
-                    const statusStyle = statusColors[request.status] || { color: "#475569", background: "#e2e8f0" };
-                    return (
-                      <article
-                        key={`resolved-${request.id}`}
-                        style={{
-                          borderRadius: "12px",
-                          border: "1px solid rgba(226,232,240,0.7)",
-                          padding: "14px",
-                          backgroundColor: "#f8fafc",
-                          display: "grid",
-                          gap: "8px",
-                        }}
-                      >
-                        <div
-                          style={{
-                            display: "flex",
-                            justifyContent: "space-between",
-                            alignItems: "center",
-                            flexWrap: "wrap",
-                            gap: "8px",
-                          }}
-                        >
-                          <div>
-                            <p style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                              {request.studentName} · {request.studentEmail}
-                            </p>
-                            <p style={{ fontSize: "12px", color: "#475569" }}>
-                              Course: {request.courseTitle || request.courseId}
-                            </p>
-                            <p style={{ fontSize: "12px", color: "#94a3b8" }}>
-                              Resolved on {request.resolvedAt ? new Date(request.resolvedAt).toLocaleString() : "N/A"}
-                            </p>
-                            {request.resolutionNote && (
-                              <p style={{ fontSize: "12px", color: "#475569" }}>Note: {request.resolutionNote}</p>
-                            )}
-                          </div>
-                          <span
-                            style={{
-                              display: "inline-flex",
-                              alignItems: "center",
-                              padding: "4px 12px",
-                              borderRadius: "999px",
-                              fontSize: "12px",
-                              fontWeight: 600,
-                              color: statusStyle.color,
-                              backgroundColor: statusStyle.background,
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {request.status}
-                          </span>
-                        </div>
+                      {!isPending && (
                         <button
                           type="button"
                           onClick={() => handleDeleteResolvedRequest(request.id)}
@@ -1363,9 +1782,10 @@ export default function TeacherSchedulePage() {
                         >
                           Remove from list
                         </button>
-                      </article>
-                    );
-                  })}
+                      )}
+                    </article>
+                  );
+                })}
                 </div>
               )}
             </section>
@@ -1379,12 +1799,12 @@ function SessionCard({ session, course, onManage, onDelete }) {
   return (
     <article
       style={{
-        borderRadius: "16px",
-        border: "1px solid rgba(226,232,240,0.9)",
-        padding: "18px",
+        borderRadius: "14px",
+        border: "1px solid rgba(203,213,225,0.75)",
+        padding: "16px",
         backgroundColor: "#f8fafc",
         display: "grid",
-        gap: "12px",
+        gap: "10px",
       }}
     >
       <div
@@ -1397,7 +1817,7 @@ function SessionCard({ session, course, onManage, onDelete }) {
         }}
       >
         <div>
-          <h3 style={{ fontSize: "15px", fontWeight: 600, color: "#0f172a" }}>
+          <h3 style={{ fontSize: "15px", fontWeight: 700, color: "#0f172a" }}>
             {session.title || course?.title || "Lesson"}
           </h3>
           <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>
@@ -1412,7 +1832,7 @@ function SessionCard({ session, course, onManage, onDelete }) {
             onClick={onManage}
             style={{
               padding: "8px 14px",
-              borderRadius: "10px",
+              borderRadius: "999px",
               border: "1px solid rgba(34,197,94,0.4)",
               backgroundColor: "white",
               color: "#15803d",
@@ -1427,7 +1847,7 @@ function SessionCard({ session, course, onManage, onDelete }) {
             onClick={onDelete}
             style={{
               padding: "8px 14px",
-              borderRadius: "10px",
+              borderRadius: "999px",
               border: "1px solid rgba(239,68,68,0.4)",
               backgroundColor: "white",
               color: "#b91c1c",

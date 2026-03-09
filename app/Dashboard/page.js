@@ -595,7 +595,10 @@ export default function DashboardPage() {
     const resources = course.teacherMaterials || [];
     return total + resources.length;
   }, 0);
+  const enrolledCourseIds = new Set(enrolledCourses.map((course) => course.id));
   const upcomingSessionCount = (lessonSessions || []).reduce((total, session) => {
+    if (!session || session.archived) return total;
+    if (session.courseId && !enrolledCourseIds.has(session.courseId)) return total;
     if (!session?.date) return total;
     const computed = new Date(`${session.date}T${session.startTime || "00:00"}`);
     if (Number.isNaN(computed.getTime())) {
@@ -1776,6 +1779,65 @@ function StudentAttendance({
     rejected: { label: 'Declined', color: '#b91c1c', background: '#fee2e2' },
   };
 
+  function parseWeekdayIndexes(dayLabel) {
+    const normalized = (dayLabel || "").toLowerCase();
+    if (!normalized) return [];
+    const indices = new Set();
+    const tokens = [
+      ["sunday", 0],
+      ["sun", 0],
+      ["monday", 1],
+      ["mon", 1],
+      ["tuesday", 2],
+      ["tue", 2],
+      ["wednesday", 3],
+      ["wed", 3],
+      ["thursday", 4],
+      ["thu", 4],
+      ["friday", 5],
+      ["fri", 5],
+      ["saturday", 6],
+      ["sat", 6],
+    ];
+
+    if (normalized.includes("weekday")) {
+      [1, 2, 3, 4, 5].forEach((value) => indices.add(value));
+    }
+    if (normalized.includes("weekend")) {
+      [0, 6].forEach((value) => indices.add(value));
+    }
+    for (const [token, index] of tokens) {
+      if (normalized.includes(token)) {
+        indices.add(index);
+      }
+    }
+    return Array.from(indices);
+  }
+
+  function getNextFixedSlotDate(dayLabel, startTime) {
+    const weekdays = parseWeekdayIndexes(dayLabel);
+    if (!weekdays.length || !startTime) return null;
+
+    const nowTime = Date.now();
+    const baseDate = new Date();
+    baseDate.setHours(0, 0, 0, 0);
+    const [hourPart, minutePart] = String(startTime || "00:00")
+      .split(":")
+      .map((value) => Number.parseInt(value, 10));
+    const hour = Number.isFinite(hourPart) ? hourPart : 0;
+    const minute = Number.isFinite(minutePart) ? minutePart : 0;
+
+    for (let offset = 0; offset < 14; offset += 1) {
+      const candidate = new Date(baseDate);
+      candidate.setDate(baseDate.getDate() + offset);
+      if (!weekdays.includes(candidate.getDay())) continue;
+      candidate.setHours(hour, minute, 0, 0);
+      if (candidate.getTime() < nowTime - 60 * 1000) continue;
+      return candidate;
+    }
+    return null;
+  }
+
   function formatRelativeTime(targetDate) {
     if (!targetDate) return '';
     const diffMs = targetDate.getTime() - Date.now();
@@ -1799,6 +1861,13 @@ function StudentAttendance({
     return diffMs >= 0 ? `in ${days} day${days > 1 ? 's' : ''}` : `${days} day${days > 1 ? 's' : ''} ago`;
   }
 
+  function formatSessionDateTime(session) {
+    if (!session?.date) return "Date TBA";
+    const computed = new Date(`${session.date}T${session.startTime || "00:00"}`);
+    if (Number.isNaN(computed.getTime())) return "Date TBA";
+    return computed.toLocaleString();
+  }
+
   function openRequestForm(session) {
     setActiveSessionId(session.id);
     setRequestDate(session.date || '');
@@ -1809,7 +1878,7 @@ function StudentAttendance({
   async function handleSubmitRequest(event) {
     event.preventDefault();
     if (!activeSessionId) return;
-    const session = relevantSessions.find((item) => item.id === activeSessionId);
+    const session = (lessonSessions || []).find((item) => item.id === activeSessionId);
     if (!session) return;
     if (!requestDate.trim()) {
       alert('Please choose a preferred make-up date.');
@@ -1843,7 +1912,40 @@ function StudentAttendance({
       dayLabel && startTime && endTime
         ? `${dayLabel} ${startTime} - ${endTime}`
         : enrollment.timeSlotLabel || "Schedule pending";
+    let nextSession = null;
+    let nextSessionTime = Number.POSITIVE_INFINITY;
+    let latestSession = null;
+    let latestSessionTime = Number.NEGATIVE_INFINITY;
+    let undatedSession = null;
+    for (const session of lessonSessions || []) {
+      if (session?.courseId !== course.id || session?.archived) continue;
+      if (!session?.date) {
+        if (!undatedSession) undatedSession = session;
+        continue;
+      }
+      const sessionTime = new Date(`${session.date}T${session.startTime || "00:00"}`).getTime();
+      if (Number.isNaN(sessionTime)) continue;
+      if (sessionTime >= now && sessionTime < nextSessionTime) {
+        nextSession = session;
+        nextSessionTime = sessionTime;
+      }
+      if (sessionTime > latestSessionTime) {
+        latestSession = session;
+        latestSessionTime = sessionTime;
+      }
+    }
+    const requestTargetSession = nextSession || latestSession || undatedSession || null;
+    const linkedRequest = requestTargetSession ? requestsBySession.get(requestTargetSession.id) : null;
+    const linkedRequestStyle =
+      linkedRequest && requestStatusStyles[linkedRequest.status || "pending"];
+    const sessionMeetingLink =
+      (nextSession?.meetingUrl ||
+        nextSession?.location ||
+        requestTargetSession?.meetingUrl ||
+        requestTargetSession?.location ||
+        "").trim();
     const meetingLink =
+      sessionMeetingLink ||
       (enrollment.meetingLink || "").trim() ||
       meetingLinkByCourse.get(course.id) ||
       "";
@@ -1852,11 +1954,22 @@ function StudentAttendance({
       : meetingLink
       ? ""
       : "Meeting link pending from instructor.";
+    const estimatedNextLesson = nextSession ? null : getNextFixedSlotDate(dayLabel, startTime);
+    const nextSessionLabel = nextSession
+      ? formatSessionDateTime(nextSession)
+      : estimatedNextLesson
+      ? `${estimatedNextLesson.toLocaleString()} (fixed slot estimate)`
+      : "";
     return {
       id: course.id,
       title: course.title,
       teacher: course.teacher,
       slotLabel,
+      nextSession,
+      nextSessionLabel,
+      requestTargetSession,
+      linkedRequest,
+      linkedRequestStyle,
       meetingLink,
       isPaid,
       joinDisabledReason,
@@ -1881,7 +1994,7 @@ function StudentAttendance({
             Weekly class schedule
           </h3>
           <p style={{ marginTop: "6px", fontSize: "12px", color: "#64748b" }}>
-            Your fixed weekly slot and class link.
+            Your fixed weekly slot. Reschedule details only appear after you submit a request.
           </p>
         </div>
         <div style={{ display: "grid", gap: "12px" }}>
@@ -1913,19 +2026,46 @@ function StudentAttendance({
                   <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#475569" }}>
                     {slot.teacher ? `Instructor: ${slot.teacher}` : "Instructor pending"}
                   </p>
+                  {slot.nextSessionLabel && (
+                    <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#64748b" }}>
+                      Next lesson: {slot.nextSessionLabel}
+                    </p>
+                  )}
                 </div>
-                <span
-                  style={{
-                    padding: "4px 12px",
-                    borderRadius: "999px",
-                    fontSize: "12px",
-                    fontWeight: 600,
-                    backgroundColor: "rgba(59,130,246,0.12)",
-                    color: "#1d4ed8",
-                  }}
-                >
-                  {slot.slotLabel}
-                </span>
+                <div style={{ display: "grid", gap: "14px", justifyItems: "end" }}>
+                  <span
+                    style={{
+                      padding: "4px 12px",
+                      borderRadius: "999px",
+                      fontSize: "12px",
+                      fontWeight: 600,
+                      backgroundColor: "rgba(59,130,246,0.12)",
+                      color: "#1d4ed8",
+                    }}
+                  >
+                    {slot.slotLabel}
+                  </span>
+                  {slot.requestTargetSession && !slot.linkedRequest && (
+                    <button
+                      type="button"
+                      onClick={() => openRequestForm(slot.requestTargetSession)}
+                      style={{
+                        marginTop: "2px",
+                        padding: "8px 14px",
+                        borderRadius: "999px",
+                        border: "1px solid rgba(14,165,233,0.4)",
+                        backgroundColor: "white",
+                        color: "#0369a1",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                        boxShadow: "0 6px 12px rgba(14,165,233,0.12)",
+                      }}
+                    >
+                      Request reschedule
+                    </button>
+                  )}
+                </div>
               </div>
 
               <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
@@ -1975,7 +2115,149 @@ function StudentAttendance({
                 ) : (
                   <span style={{ fontSize: "12px", color: "#64748b" }}>Link ready</span>
                 )}
+
               </div>
+
+              {slot.linkedRequest && (
+                <div
+                  style={{
+                    borderRadius: "12px",
+                    padding: "10px 12px",
+                    backgroundColor:
+                      (slot.linkedRequestStyle && slot.linkedRequestStyle.background) ||
+                      "rgba(233,233,233,0.4)",
+                    color: (slot.linkedRequestStyle && slot.linkedRequestStyle.color) || "#475569",
+                    fontSize: "12px",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  <strong style={{ fontWeight: 600 }}>
+                    Reschedule {(slot.linkedRequestStyle && slot.linkedRequestStyle.label) || slot.linkedRequest.status}:
+                  </strong>{" "}
+                  {slot.linkedRequest.requestedDate || "Date pending"}
+                  {slot.linkedRequest.requestedTime ? ` ${slot.linkedRequest.requestedTime}` : ""}
+                  {slot.linkedRequest.resolutionNote
+                    ? ` · Instructor note: ${slot.linkedRequest.resolutionNote}`
+                    : ""}
+                </div>
+              )}
+
+              {slot.requestTargetSession &&
+                activeSessionId === slot.requestTargetSession.id &&
+                !slot.linkedRequest && (
+                <div
+                  style={{
+                    borderRadius: "14px",
+                    border: "1px solid rgba(148,163,184,0.3)",
+                    backgroundColor: "rgba(224,242,254,0.35)",
+                    padding: "14px",
+                  }}
+                >
+                  <form onSubmit={handleSubmitRequest} style={{ display: "grid", gap: "10px" }}>
+                    <div
+                      style={{
+                        display: "grid",
+                        gap: "10px",
+                        gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                      }}
+                    >
+                      <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
+                        Preferred date
+                        <input
+                          type="date"
+                          value={requestDate}
+                          onChange={(event) => setRequestDate(event.target.value)}
+                          style={{
+                            padding: "10px 12px",
+                            borderRadius: "10px",
+                            border: "1px solid rgba(31,41,55,0.3)",
+                            backgroundColor: "white",
+                            color: "#0f172a",
+                            fontSize: "13px",
+                            width: "100%",
+                          }}
+                        />
+                      </label>
+                      <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
+                        Preferred time
+                        <input
+                          type="time"
+                          value={requestTime}
+                          onChange={(event) => setRequestTime(event.target.value)}
+                          style={{
+                            padding: "10px 12px",
+                            borderRadius: "10px",
+                            border: "1px solid rgba(31,41,55,0.3)",
+                            backgroundColor: "white",
+                            color: "#0f172a",
+                            fontSize: "13px",
+                            width: "100%",
+                          }}
+                        />
+                      </label>
+                    </div>
+
+                    <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
+                      Reason / details
+                      <textarea
+                        rows={3}
+                        value={requestMessage}
+                        onChange={(event) => setRequestMessage(event.target.value)}
+                        placeholder="Briefly describe why you need to reschedule."
+                        style={{
+                          padding: "12px",
+                          borderRadius: "10px",
+                          border: "1px solid rgba(148,163,184,0.4)",
+                          backgroundColor: "white",
+                          color: "#0f172a",
+                          fontSize: "13px",
+                          resize: "vertical",
+                        }}
+                      />
+                    </label>
+
+                    <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                      <button
+                        type="submit"
+                        disabled={submittingRequestId === slot.requestTargetSession.id}
+                        style={{
+                          padding: "9px 16px",
+                          borderRadius: "10px",
+                          border: "none",
+                          background: submittingRequestId === slot.requestTargetSession.id
+                            ? "#94a3b8"
+                            : "linear-gradient(120deg, #0ea5e9, #0284c7)",
+                          color: "white",
+                          fontWeight: 600,
+                          cursor:
+                            submittingRequestId === slot.requestTargetSession.id
+                              ? "not-allowed"
+                              : "pointer",
+                        }}
+                      >
+                        {submittingRequestId === slot.requestTargetSession.id
+                          ? "Sending..."
+                          : "Submit request"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setActiveSessionId(null)}
+                        style={{
+                          padding: "9px 16px",
+                          borderRadius: "10px",
+                          border: "1px solid rgba(148,163,184,0.4)",
+                          backgroundColor: "white",
+                          color: "#475569",
+                          fontWeight: 600,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -2110,25 +2392,6 @@ function StudentAttendance({
                 >
                   {statusStyle.label}
                 </span>
-                {!relatedRequest && (
-                  <button
-                    type='button'
-                    onClick={() => openRequestForm(session)}
-                    style={{
-                      padding: '8px 16px',
-                      borderRadius: '999px',
-                      border: '1px solid rgba(14,165,233,0.4)',
-                      backgroundColor: 'white',
-                      color: '#0369a1',
-                      fontSize: '12px',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                      boxShadow: '0 6px 12px rgba(14,165,233,0.15)',
-                    }}
-                  >
-                    Request reschedule
-                  </button>
-                )}
               </div>
             </div>
 
@@ -2177,116 +2440,6 @@ function StudentAttendance({
               </div>
             )}
 
-            {activeSessionId === session.id && !relatedRequest && (
-              <div
-                style={{
-                  borderRadius: '18px',
-                  border: '1px solid rgba(148,163,184,0.25)',
-                  backgroundColor: 'rgba(224,242,254,0.35)',
-                  padding: '16px',
-                }}
-              >
-                <form onSubmit={handleSubmitRequest} style={{ display: 'grid', gap: '12px' }}>
-                  <div
-                    style={{
-                      display: 'grid',
-                      gap: '12px',
-                      gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
-                    }}
-                  >
-                    <label style={{ display: 'grid', gap: '6px', fontSize: '12px', fontWeight: 600, color: '#0f172a' }}>
-                      Preferred date
-                      <input
-                        type='date'
-                        value={requestDate}
-                        onChange={(event) => setRequestDate(event.target.value)}
-                        style={{
-                          padding: '10px 12px',
-                          borderRadius: '12px',
-                          border: '1px solid rgba(31,41,55,0.4)',
-                          backgroundColor: '#2f3137',
-                          color: '#f8fafc',
-                          fontSize: '13px',
-                          width: '100%',
-                        }}
-                      />
-                    </label>
-                    <label style={{ display: 'grid', gap: '6px', fontSize: '12px', fontWeight: 600, color: '#0f172a' }}>
-                      Preferred time
-                      <input
-                        type='time'
-                        value={requestTime}
-                        onChange={(event) => setRequestTime(event.target.value)}
-                        style={{
-                          padding: '10px 12px',
-                          borderRadius: '12px',
-                          border: '1px solid rgba(31,41,55,0.4)',
-                          backgroundColor: '#2f3137',
-                          color: '#f8fafc',
-                          fontSize: '13px',
-                          width: '100%',
-                        }}
-                      />
-                    </label>
-                  </div>
-
-                  <label style={{ display: 'grid', gap: '6px', fontSize: '12px', fontWeight: 600, color: '#0f172a' }}>
-                    Reason / details
-                    <textarea
-                      rows={3}
-                      value={requestMessage}
-                      onChange={(event) => setRequestMessage(event.target.value)}
-                      placeholder='Briefly describe why you need to reschedule.'
-                      style={{
-                        padding: '12px',
-                        borderRadius: '12px',
-                        border: '1px solid rgba(148,163,184,0.4)',
-                        backgroundColor: 'rgba(255,255,255,0.95)',
-                        color: '#0f172a',
-                        fontSize: '13px',
-                        resize: 'vertical',
-                      }}
-                    />
-                  </label>
-
-                  <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-                    <button
-                      type='submit'
-                      disabled={isSubmitting}
-                      style={{
-                        padding: '10px 18px',
-                        borderRadius: '12px',
-                        border: 'none',
-                        background: isSubmitting
-                          ? '#94a3b8'
-                          : 'linear-gradient(120deg, #0ea5e9, #0284c7)',
-                        color: 'white',
-                        fontWeight: 600,
-                        cursor: isSubmitting ? 'not-allowed' : 'pointer',
-                        boxShadow: '0 10px 20px rgba(14,165,233,0.25)',
-                      }}
-                    >
-                      {isSubmitting ? 'Sending...' : 'Submit request'}
-                    </button>
-                    <button
-                      type='button'
-                      onClick={() => setActiveSessionId(null)}
-                      style={{
-                        padding: '10px 18px',
-                        borderRadius: '12px',
-                        border: '1px solid rgba(148,163,184,0.4)',
-                        backgroundColor: 'white',
-                        color: '#475569',
-                        fontWeight: 600,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                </form>
-              </div>
-            )}
           </article>
         );
       })}

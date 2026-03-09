@@ -2,14 +2,17 @@
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
-import { createUserWithEmailAndPassword } from "firebase/auth";
-import { doc, serverTimestamp, setDoc } from "firebase/firestore";
+import {
+  GoogleAuthProvider,
+  createUserWithEmailAndPassword,
+  signInWithPopup,
+} from "firebase/auth";
+import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
 
 const roles = [
   { value: "student", label: "Student" },
   { value: "teacher", label: "Teacher" },
-  { value: "admin", label: "Admin" },
 ];
 
 export default function RegisterPage() {
@@ -17,6 +20,9 @@ export default function RegisterPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [role, setRole] = useState(roles[0].value);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const googleProvider = new GoogleAuthProvider();
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -28,6 +34,7 @@ export default function RegisterPage() {
     }
 
     try {
+      setIsSubmitting(true);
       const credential = await createUserWithEmailAndPassword(
         auth,
         trimmedEmail,
@@ -45,6 +52,36 @@ export default function RegisterPage() {
     } catch (error) {
       console.error("Failed to register user", error);
       alert(error instanceof Error ? error.message : "Failed to register. Please try again.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleGoogleRegister() {
+    try {
+      setIsSubmitting(true);
+      const credential = await signInWithPopup(auth, googleProvider);
+      const profileRef = doc(db, "users", credential.user.uid);
+      const profileSnap = await getDoc(profileRef);
+
+      if (!profileSnap.exists()) {
+        await setDoc(profileRef, {
+          email: credential.user.email ?? "",
+          role,
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      const nextRole = profileSnap.exists()
+        ? profileSnap.data().role ?? "student"
+        : role;
+      const nextRoute = nextRole === "teacher" ? "/teacher/dashboard" : "/Dashboard";
+      router.push(nextRoute);
+    } catch (error) {
+      console.error("Failed to register with Google", error);
+      alert(error instanceof Error ? error.message : "Google registration failed. Please try again.");
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
@@ -258,6 +295,7 @@ export default function RegisterPage() {
 
           <button
             type="submit"
+            disabled={isSubmitting}
             style={{
               padding: "14px 18px",
               borderRadius: "12px",
@@ -269,9 +307,30 @@ export default function RegisterPage() {
               cursor: "pointer",
               boxShadow: "0 12px 24px rgba(22, 163, 74, 0.28)",
               transition: "transform 0.2s ease",
+              opacity: isSubmitting ? 0.7 : 1,
             }}
           >
-            Create account
+            {isSubmitting ? "Processing..." : "Create account"}
+          </button>
+
+          <button
+            type="button"
+            onClick={handleGoogleRegister}
+            disabled={isSubmitting}
+            style={{
+              padding: "14px 18px",
+              borderRadius: "12px",
+              border: "1px solid #cbd5e1",
+              background: "#ffffff",
+              color: "#0f172a",
+              fontWeight: 700,
+              fontSize: "15px",
+              cursor: "pointer",
+              boxShadow: "0 10px 20px rgba(15, 23, 42, 0.08)",
+              opacity: isSubmitting ? 0.7 : 1,
+            }}
+          >
+            Continue with Google
           </button>
 
           <p style={{ fontSize: "13px", color: "#475569", margin: 0 }}>

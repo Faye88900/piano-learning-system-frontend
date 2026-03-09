@@ -2,8 +2,12 @@
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { signInWithEmailAndPassword } from "firebase/auth";
-import { doc, getDoc } from "firebase/firestore";
+import {
+  GoogleAuthProvider,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+} from "firebase/auth";
+import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
 import { useSessionUser } from "@/hooks/useSessionUser";
 
@@ -11,7 +15,9 @@ export default function LoginPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const { sessionUser, loading } = useSessionUser();
+  const googleProvider = new GoogleAuthProvider();
 
   useEffect(() => {
 
@@ -33,6 +39,7 @@ export default function LoginPage() {
     }
 
     try {
+      setIsSubmitting(true);
       const credential = await signInWithEmailAndPassword(
         //认证密码和gmail 登入相对的页面
         auth,
@@ -52,6 +59,36 @@ export default function LoginPage() {
     } catch (error) {
       console.error("Failed to sign in", error);
       alert(error instanceof Error ? error.message : "Incorrect email or password");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleGoogleSignIn() {
+    try {
+      setIsSubmitting(true);
+      const credential = await signInWithPopup(auth, googleProvider);
+      const profileRef = doc(db, "users", credential.user.uid);
+      const profileSnap = await getDoc(profileRef);
+
+      if (!profileSnap.exists()) {
+        await setDoc(profileRef, {
+          email: credential.user.email ?? "",
+          role: "student",
+          createdAt: serverTimestamp(),
+        });
+      }
+
+      const nextRole = profileSnap.exists()
+        ? profileSnap.data().role ?? "student"
+        : "student";
+      const nextRoute = nextRole === "teacher" ? "/teacher/dashboard" : "/Dashboard";
+      router.push(nextRoute);
+    } catch (error) {
+      console.error("Failed to sign in with Google", error);
+      alert(error instanceof Error ? error.message : "Google sign-in failed. Please try again.");
+    } finally {
+      setIsSubmitting(false);
     }
   }
 
@@ -302,6 +339,7 @@ export default function LoginPage() {
 
             <button
               type="submit"
+              disabled={isSubmitting}
               style={{
                 padding: "14px 18px",
                 borderRadius: "12px",
@@ -312,9 +350,30 @@ export default function LoginPage() {
                 fontSize: "15px",
                 cursor: "pointer",
                 boxShadow: "0 12px 24px rgba(37, 99, 235, 0.35)",
+                opacity: isSubmitting ? 0.7 : 1,
               }}
             >
-              Sign in to dashboard
+              {isSubmitting ? "Processing..." : "Sign in to dashboard"}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleGoogleSignIn}
+              disabled={isSubmitting}
+              style={{
+                padding: "14px 18px",
+                borderRadius: "12px",
+                border: "1px solid #cbd5e1",
+                background: "#ffffff",
+                color: "#0f172a",
+                fontWeight: 700,
+                fontSize: "15px",
+                cursor: "pointer",
+                boxShadow: "0 10px 20px rgba(15, 23, 42, 0.08)",
+                opacity: isSubmitting ? 0.7 : 1,
+              }}
+            >
+              Continue with Google
             </button>
 
             <p style={{ fontSize: "13px", color: "#475569", margin: 0 }}>
