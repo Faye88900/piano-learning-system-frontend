@@ -39,9 +39,23 @@ The system is designed for **Students** and **Teachers**, providing role-based f
 
 The application is deployed on Vercel and available at:
 
-🔗 https://piano-learning-system-frontend-zfe2.vercel.app
+- https://piano-learning-system-frontend-zfe2.vercel.app
 
 Payment is integrated using Stripe Checkout in **test mode**. No real payment is required.
+
+## HR Demo Access
+
+Use this account to review the teacher-side features.
+
+- Teacher login URL: `https://piano-learning-system-frontend-zfe2.vercel.app/login`
+- Email: `teacher-demo@yourdomain.com`
+- Password: `ChangeThisPassword123!`
+
+Notes:
+- New public registrations are created as **Student** accounts.
+- **Teacher** accounts are assigned by **Admin**.
+- If this repository is public, do not use a real production teacher password here.
+
 
 ## System Demo Flow
 
@@ -79,3 +93,4 @@ This system supports two main user roles: **Student** and **Teacher**.
 ```bash
 npm install
 npm run dev
+```
