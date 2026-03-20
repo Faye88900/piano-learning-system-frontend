@@ -24,7 +24,7 @@ export async function POST(req) {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { courseId, enrollmentId, studentEmail, studentName } = body || {};
+  const { courseId, enrollmentId, slotId, slotLabel, studentEmail, studentName } = body || {};
   if (!courseId || !enrollmentId) {
     return NextResponse.json({ error: "courseId and enrollmentId are required" }, { status: 400 });
   }
@@ -51,7 +51,7 @@ export async function POST(req) {
             currency: "myr",
             unit_amount: unitAmount,
             product_data: {
-              name: `${course.title} — ${studentName || "Student"}`,
+              name: `${course.title} - ${studentName || "Student"}`,
               metadata: { courseId },
             },
           },
@@ -61,6 +61,8 @@ export async function POST(req) {
       metadata: {
         enrollmentId,
         courseId,
+        slotId: slotId || "",
+        slotLabel: slotLabel || "",
       },
       success_url: `${getBaseUrl()}/Dashboard?payment=success`,
       cancel_url: `${getBaseUrl()}/Dashboard?payment=cancelled`,

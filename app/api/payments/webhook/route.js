@@ -74,21 +74,53 @@ export async function POST(req) {
             console.error("Failed to retrieve payment intent/receipt", error);
           }
         }
+        const paidAt = new Date().toISOString();
+        const enrollmentRef = adminDb.collection("enrollments").doc(enrollmentId);
+        await adminDb.runTransaction(async (tx) => {
+          const enrollmentSnap = await tx.get(enrollmentRef);
+          const enrollmentData = enrollmentSnap.exists ? enrollmentSnap.data() || {} : {};
+          const resolvedCourseId = courseId || enrollmentData.courseId || "";
+          const slotId = enrollmentData.timeSlot || "";
+          const slotLabel = enrollmentData.timeSlotLabel || "";
 
-        await adminDb.collection("enrollments").doc(enrollmentId).set(
-          {
-            status: "Paid",
-            paymentStatus: "paid",
-            paymentIntentId,
-            paymentProvider: "stripe",
-            paymentAmount: amountReceived,
-            paymentCurrency: currency,
-            paymentReceiptUrl: receiptUrl,
-            paidAt: new Date().toISOString(),
-            courseId: courseId || "",
-          },
-          { merge: true }
-        );
+          tx.set(
+            enrollmentRef,
+            {
+              status: "Paid",
+              paymentStatus: "paid",
+              paymentIntentId,
+              paymentProvider: "stripe",
+              paymentAmount: amountReceived,
+              paymentCurrency: currency,
+              paymentReceiptUrl: receiptUrl,
+              paidAt,
+              courseId: resolvedCourseId,
+              slotReservationExpiresAt: null,
+            },
+            { merge: true }
+          );
+
+          if (resolvedCourseId && slotId) {
+            const slotLockRef = adminDb.collection("courseSlotLocks").doc(`${resolvedCourseId}_${slotId}`);
+            tx.set(
+              slotLockRef,
+              {
+                courseId: resolvedCourseId,
+                slotId,
+                slotLabel,
+                studentUid: enrollmentData.studentUid || "",
+                studentEmail: enrollmentData.studentEmail || "",
+                enrollmentId,
+                paymentStatus: "paid",
+                status: "paid",
+                paidAt,
+                reservedUntil: null,
+                updatedAt: paidAt,
+              },
+              { merge: true }
+            );
+          }
+        });
       }
     }
   } catch (error) {
