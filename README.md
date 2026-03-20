@@ -48,8 +48,8 @@ Payment is integrated using Stripe Checkout in **test mode**. No real payment is
 Use this account to review the teacher-side features.
 
 - Teacher login URL: `https://piano-learning-system-frontend-zfe2.vercel.app/login`
-- Email: `teacher-demo@yourdomain.com`
-- Password: `ChangeThisPassword123!`
+- Email: `kinojig185@fuzitea.com`
+- Password: `111111`
 
 Notes:
 - New public registrations are created as **Student** accounts.
