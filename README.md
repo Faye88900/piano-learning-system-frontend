@@ -54,8 +54,6 @@ Use this account to review the teacher-side features.
 Notes:
 - New public registrations are created as **Student** accounts.
 - **Teacher** accounts are assigned by **Admin**.
-- If this repository is public, do not use a real production teacher password here.
-
 
 ## System Demo Flow
 
