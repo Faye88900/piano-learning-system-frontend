@@ -1,15 +1,31 @@
 ﻿"use client";
 
 import Link from "next/link";
-import { use, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, use, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import {collection,deleteDoc,doc,onSnapshot,orderBy,query,serverTimestamp,setDoc,where,} from "firebase/firestore";
+import {collection,deleteDoc,doc,onSnapshot,orderBy,query,runTransaction,serverTimestamp,setDoc,where,} from "firebase/firestore";
 import { getCourseById } from "@/lib/courseCatalog";
 import { db } from "@/lib/firebase";
 import { useSessionUser } from "@/hooks/useSessionUser";
 
 const paymentOptions = [
   { value: "pay_now", label: "Pay now (credit / debit card)", status: "Awaiting payment" },
+];
+const SLOT_RESERVATION_MINUTES = 15;
+const WEEK_COLUMNS = [
+  { day: 1, label: "Mon" },
+  { day: 2, label: "Tue" },
+  { day: 3, label: "Wed" },
+  { day: 4, label: "Thu" },
+  { day: 5, label: "Fri" },
+  { day: 6, label: "Sat" },
+  { day: 7, label: "Sun" },
+];
+const TIME_BANDS = [
+  { key: "morning", label: "morning", range: "06:00-12:00" },
+  { key: "afternoon", label: "afternoon", range: "12:00-18:00" },
+  { key: "evening", label: "evening", range: "18:00-24:00" },
+  { key: "late_night", label: "late night", range: "00:00-06:00" },
 ];
 
 function hasPaidAccess(enrollment) {
@@ -36,6 +52,137 @@ function parseTimeToMinutes(value) {
   const [h, m] = value.split(":").map((part) => Number(part));
   if (!Number.isFinite(h) || !Number.isFinite(m)) return null;
   return h * 60 + m;
+}
+
+function parseWeekdayIndexes(label) {
+  const normalized = String(label || "").toLowerCase();
+  if (!normalized) return [];
+  const indexes = new Set();
+
+  const tokens = [
+    ["monday", 1],
+    ["mon", 1],
+    ["tuesday", 2],
+    ["tue", 2],
+    ["wednesday", 3],
+    ["wed", 3],
+    ["thursday", 4],
+    ["thu", 4],
+    ["friday", 5],
+    ["fri", 5],
+    ["saturday", 6],
+    ["sat", 6],
+    ["sunday", 7],
+    ["sun", 7],
+  ];
+
+  if (normalized.includes("weekday")) {
+    [1, 2, 3, 4, 5].forEach((day) => indexes.add(day));
+  }
+  if (normalized.includes("weekend")) {
+    [6, 7].forEach((day) => indexes.add(day));
+  }
+  for (const [token, day] of tokens) {
+    if (normalized.includes(token)) indexes.add(day);
+  }
+  const numericTokens = normalized.match(/\b[1-7]\b/g) || [];
+  for (const token of numericTokens) {
+    indexes.add(Number(token));
+  }
+
+  return Array.from(indexes);
+}
+
+function normalizeDayIndexes(days) {
+  if (!Array.isArray(days)) return [];
+  const indexes = new Set();
+  for (const day of days) {
+    const parsed = Number(day);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 7) {
+      indexes.add(parsed);
+    }
+  }
+  return Array.from(indexes).sort((a, b) => a - b);
+}
+
+function formatDayIndexes(indexes) {
+  const days = normalizeDayIndexes(indexes);
+  if (!days.length) return "";
+
+  const weekdaySet = [1, 2, 3, 4, 5];
+  const weekendSet = [6, 7];
+  if (weekdaySet.length === days.length && weekdaySet.every((day, i) => days[i] === day)) {
+    return "Weekdays";
+  }
+  if (weekendSet.length === days.length && weekendSet.every((day, i) => days[i] === day)) {
+    return "Weekend";
+  }
+
+  const dayNames = days
+    .map((day) => WEEK_COLUMNS.find((column) => column.day === day)?.label)
+    .filter(Boolean);
+  if (dayNames.length <= 1) return dayNames[0] || "";
+  if (dayNames.length === 2) return `${dayNames[0]} & ${dayNames[1]}`;
+  return `${dayNames.slice(0, -1).join(", ")} & ${dayNames[dayNames.length - 1]}`;
+}
+
+function getSlotDayIndexes(slot) {
+  const fromDays = normalizeDayIndexes(slot?.days);
+  if (fromDays.length) return fromDays;
+  return parseWeekdayIndexes(slot?.dayOfWeek || slot?.label || "");
+}
+
+function getSlotDayLabel(slot) {
+  const explicit = String(slot?.dayOfWeek || "").trim();
+  if (explicit) return explicit;
+  return formatDayIndexes(getSlotDayIndexes(slot));
+}
+
+function getSlotDisplayLabel(slot) {
+  const explicit = String(slot?.label || "").trim();
+  if (explicit) return explicit;
+  const dayLabel = getSlotDayLabel(slot);
+  const start = slot?.startTime || "--:--";
+  const end = slot?.endTime || "--:--";
+  return dayLabel ? `${dayLabel} ${start} - ${end}` : `${start} - ${end}`;
+}
+
+function getBandByStartTime(startTime) {
+  const minutes = parseTimeToMinutes(startTime || "");
+  if (!Number.isFinite(minutes)) return null;
+  const hour = Math.floor(minutes / 60);
+  if (hour >= 6 && hour < 12) return "morning";
+  if (hour >= 12 && hour < 18) return "afternoon";
+  if (hour >= 18 && hour < 24) return "evening";
+  return "late_night";
+}
+
+function toMillis(value) {
+  if (!value) return null;
+  if (typeof value.toDate === "function") {
+    const date = value.toDate();
+    const ms = date instanceof Date ? date.getTime() : NaN;
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function isEnrollmentBlockingSlot(enrollment, nowMs = Date.now()) {
+  if (!enrollment?.timeSlot) return false;
+  const status = typeof enrollment.status === "string" ? enrollment.status.toLowerCase() : "";
+  if (status === "cancelled" || status === "canceled" || status === "withdrawn") return false;
+
+  if (hasPaidAccess(enrollment)) return true;
+
+  const reservationMs = toMillis(enrollment.slotReservationExpiresAt);
+  if (Number.isFinite(reservationMs)) return reservationMs > nowMs;
+
+  return true;
+}
+
+function isPermissionError(error) {
+  return error?.code === "permission-denied" || error?.code === "failed-precondition";
 }
 
 function getAverageSlotHours(timeSlots) {
@@ -305,6 +452,69 @@ export default function CourseDetailPage({ params }) {
   }, [course?.id, sessionUser?.uid]);
 
   const activeToastTheme = toast ? toastThemes[toast.type ?? "info"] : null;
+  const blockedSlotIds = useMemo(() => {
+    if (!courseEnrollmentRecords.length) return new Set();
+    const nowMs = Date.now();
+    const blocked = new Set();
+    const currentUid = sessionUser?.uid ?? "";
+    const currentEmail = (sessionUser?.email || "").toLowerCase();
+
+    for (const entry of courseEnrollmentRecords) {
+      if (!entry?.timeSlot) continue;
+      const entryUid = entry.studentUid || "";
+      const entryEmail = (entry.studentEmail || "").toLowerCase();
+      const isCurrentUser =
+        (currentUid && entryUid === currentUid) || (currentEmail && entryEmail === currentEmail);
+      if (isCurrentUser) continue;
+      if (isEnrollmentBlockingSlot(entry, nowMs)) {
+        blocked.add(entry.timeSlot);
+      }
+    }
+    return blocked;
+  }, [courseEnrollmentRecords, sessionUser?.uid, sessionUser?.email]);
+  const slotGrid = useMemo(() => {
+    const cellToSlotIds = new Map();
+    const slotIdToCells = new Map();
+    const slots = Array.isArray(course?.timeSlots) ? course.timeSlots : [];
+
+    for (const slot of slots) {
+      const dayIndexes = getSlotDayIndexes(slot);
+      const bandKey = getBandByStartTime(slot?.startTime || "");
+      if (!dayIndexes.length || !bandKey) continue;
+
+      for (const day of dayIndexes) {
+        const cellKey = `${bandKey}:${day}`;
+        if (!cellToSlotIds.has(cellKey)) cellToSlotIds.set(cellKey, []);
+        cellToSlotIds.get(cellKey).push(slot.id);
+
+        if (!slotIdToCells.has(slot.id)) slotIdToCells.set(slot.id, []);
+        slotIdToCells.get(slot.id).push(cellKey);
+      }
+    }
+
+    return { cellToSlotIds, slotIdToCells };
+  }, [course?.timeSlots]);
+  const selectedCellKey = useMemo(() => {
+    if (!timeSlot) return "";
+    return slotGrid.slotIdToCells.get(timeSlot)?.[0] || "";
+  }, [slotGrid, timeSlot]);
+
+  useEffect(() => {
+    if (!Array.isArray(course?.timeSlots) || !course.timeSlots.length) {
+      if (timeSlot) setTimeSlot("");
+      return;
+    }
+
+    const selectedIsUsable = course.timeSlots.some(
+      (slot) => slot.id === timeSlot && !blockedSlotIds.has(slot.id)
+    );
+    if (selectedIsUsable) return;
+
+    const nextAvailableSlotId = course.timeSlots.find((slot) => !blockedSlotIds.has(slot.id))?.id || "";
+    if (nextAvailableSlotId !== timeSlot) {
+      setTimeSlot(nextAvailableSlotId);
+    }
+  }, [course?.id, course?.timeSlots, blockedSlotIds, timeSlot]);
 
   if (loading) {
     return null;
@@ -363,9 +573,23 @@ export default function CourseDetailPage({ params }) {
   const isPaymentPending =
   existingEnrollment?.paymentStatus === "pending" ||
   existingEnrollment?.status?.toLowerCase?.() === "awaiting payment";
-  const selectedSlot = course.timeSlots?.find((slot) => slot.id === timeSlot) ?? null;
+  const courseTimeSlots = Array.isArray(course?.timeSlots) ? course.timeSlots : [];
+  const selectedSlot = courseTimeSlots.find((slot) => slot.id === timeSlot) ?? null;
+  const selectedSlotLabel = selectedSlot ? getSlotDisplayLabel(selectedSlot) : "";
+  const selectedSlotDayLabel = selectedSlot ? getSlotDayLabel(selectedSlot) : "";
+  const selectedSlotDays = selectedSlot ? getSlotDayIndexes(selectedSlot) : [];
+  const noAvailableSlots = courseTimeSlots.every((slot) => blockedSlotIds.has(slot.id));
+  const localTimeZone =
+    (typeof Intl !== "undefined" && Intl.DateTimeFormat().resolvedOptions().timeZone) || "Local Time";
   const selectedPayment = paymentOptions.find((option) => option.value === paymentOption);
   const enrollmentDocId = sessionUser?.uid && course ? `${sessionUser.uid}_${course.id}` : null;
+
+  function handleGridSelect(cellKey) {
+    const slotIds = slotGrid.cellToSlotIds.get(cellKey) || [];
+    const availableSlotId = slotIds.find((slotId) => !blockedSlotIds.has(slotId)) || "";
+    if (!availableSlotId) return;
+    setTimeSlot(availableSlotId);
+  }
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -382,6 +606,19 @@ export default function CourseDetailPage({ params }) {
 
     if (!timeSlot) {
       showToast({ type: "error", message: "Please choose a preferred time slot." });
+      return;
+    }
+
+    if (!selectedSlot) {
+      showToast({ type: "error", message: "Selected time slot is no longer available. Please choose again." });
+      return;
+    }
+
+    if (blockedSlotIds.has(timeSlot)) {
+      showToast({
+        type: "error",
+        message: "This time slot is already booked. Please choose another available slot.",
+      });
       return;
     }
 
@@ -406,29 +643,92 @@ export default function CourseDetailPage({ params }) {
         : payNow
         ? selectedPayment?.status ?? "Awaiting payment"
         : existingEnrollment?.status ?? "Pending";
+      const reservationExpiresAt = payNow
+        ? new Date(Date.now() + SLOT_RESERVATION_MINUTES * 60 * 1000).toISOString()
+        : null;
+      const enrollmentRef = doc(db, "enrollments", enrollmentDocId);
+      const nextSlotLockRef = doc(db, "courseSlotLocks", `${course.id}_${selectedSlot?.id || ""}`);
 
-      await setDoc(
-        doc(db, "enrollments", enrollmentDocId),
-        {
-          courseId: course.id,
-          id: course.id,
-          courseTitle: course.title,
-          studentUid: sessionUser.uid,
-          studentEmail: sessionUser.email ?? "",
-          studentName: studentName.trim(),
-          timeSlot: selectedSlot?.id ?? "",
-          timeSlotLabel: selectedSlot?.label ?? "",
-          timeSlotDay: selectedSlot?.dayOfWeek ?? "",
-          timeSlotStartTime: selectedSlot?.startTime ?? "",
-          timeSlotEndTime: selectedSlot?.endTime ?? "",
-          paymentOption,
-          paymentStatus: nextPaymentStatus,
-          status: nextStatus,
-          meetingLink: existingEnrollment?.meetingLink ?? "",
-          enrolledAt: new Date().toISOString(),
-        },
-        { merge: true }
-      );
+      await runTransaction(db, async (tx) => {
+        const enrollmentSnap = await tx.get(enrollmentRef);
+        const previousEnrollmentData = enrollmentSnap.exists() ? enrollmentSnap.data() : {};
+        const previousSlotId = previousEnrollmentData?.timeSlot || "";
+
+        const nextSlotLockSnap = await tx.get(nextSlotLockRef);
+        if (nextSlotLockSnap.exists()) {
+          const lockData = nextSlotLockSnap.data() || {};
+          const lockOwner = lockData.studentUid || "";
+          const lockIsPaid =
+            String(lockData.paymentStatus || "").toLowerCase() === "paid" ||
+            String(lockData.status || "").toLowerCase() === "paid";
+          const lockExpiresMs = toMillis(lockData.reservedUntil);
+          const lockStillActive =
+            lockIsPaid || !Number.isFinite(lockExpiresMs) || lockExpiresMs > Date.now();
+          if (lockOwner && lockOwner !== sessionUser.uid && lockStillActive) {
+            throw new Error("SLOT_ALREADY_BOOKED");
+          }
+        }
+
+        if (previousSlotId && previousSlotId !== selectedSlot?.id) {
+          const previousSlotLockRef = doc(db, "courseSlotLocks", `${course.id}_${previousSlotId}`);
+          const previousSlotLockSnap = await tx.get(previousSlotLockRef);
+          if (previousSlotLockSnap.exists()) {
+            const previousLockData = previousSlotLockSnap.data() || {};
+            const previousLockOwner = previousLockData.studentUid || "";
+            const previousLockEnrollment = previousLockData.enrollmentId || "";
+            if (
+              !previousLockOwner ||
+              previousLockOwner === sessionUser.uid ||
+              previousLockEnrollment === enrollmentDocId
+            ) {
+              tx.delete(previousSlotLockRef);
+            }
+          }
+        }
+
+        tx.set(
+          enrollmentRef,
+          {
+            courseId: course.id,
+            id: course.id,
+            courseTitle: course.title,
+            studentUid: sessionUser.uid,
+            studentEmail: sessionUser.email ?? "",
+            studentName: studentName.trim(),
+            timeSlot: selectedSlot?.id ?? "",
+            timeSlotLabel: selectedSlotLabel,
+            timeSlotDay: selectedSlotDayLabel,
+            timeSlotDays: selectedSlotDays,
+            timeSlotStartTime: selectedSlot?.startTime ?? "",
+            timeSlotEndTime: selectedSlot?.endTime ?? "",
+            paymentOption,
+            paymentStatus: nextPaymentStatus,
+            status: nextStatus,
+            meetingLink: previousEnrollmentData?.meetingLink ?? existingEnrollment?.meetingLink ?? "",
+            slotReservationExpiresAt: reservationExpiresAt,
+            enrolledAt: previousEnrollmentData?.enrolledAt ?? new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+
+        tx.set(
+          nextSlotLockRef,
+          {
+            courseId: course.id,
+            slotId: selectedSlot?.id ?? "",
+            slotLabel: selectedSlotLabel,
+            studentUid: sessionUser.uid,
+            studentEmail: sessionUser.email ?? "",
+            enrollmentId: enrollmentDocId,
+            paymentStatus: nextPaymentStatus,
+            status: nextPaymentStatus === "paid" ? "paid" : "reserved",
+            reservedUntil: reservationExpiresAt,
+            updatedAt: new Date().toISOString(),
+          },
+          { merge: true }
+        );
+      });
 
       if (isPaid) {
         showToast({
@@ -445,6 +745,8 @@ export default function CourseDetailPage({ params }) {
           body: JSON.stringify({
             courseId: course.id,
             enrollmentId: enrollmentDocId,
+            slotId: selectedSlot?.id ?? "",
+            slotLabel: selectedSlotLabel,
             studentEmail: sessionUser.email,
             studentName: studentName.trim(),
           }),
@@ -471,6 +773,22 @@ export default function CourseDetailPage({ params }) {
       });
     } catch (error) {
       console.error("Failed to submit enrollment", error);
+      if (error?.message === "SLOT_ALREADY_BOOKED") {
+        showToast({
+          type: "error",
+          message: "This time slot has just been taken by another student. Please choose another slot.",
+        });
+        return;
+      }
+      if (isPermissionError(error)) {
+        showToast({
+          type: "error",
+          message:
+            "Booking lock requires Firestore rules for courseSlotLocks. Please publish rules first, then retry.",
+          duration: 5500,
+        });
+        return;
+      }
       showToast({ type: "error", message: "Unable to save your enrollment. Please try again." });
     }
   }
@@ -480,8 +798,29 @@ export default function CourseDetailPage({ params }) {
       return;
     }
 
+    const enrollmentRef = doc(db, "enrollments", enrollmentDocId);
     try {
-      await deleteDoc(doc(db, "enrollments", enrollmentDocId));
+      await runTransaction(db, async (tx) => {
+        const enrollmentSnap = await tx.get(enrollmentRef);
+        if (!enrollmentSnap.exists()) return;
+        const enrollmentData = enrollmentSnap.data() || {};
+        const reservedSlotId = enrollmentData.timeSlot || "";
+
+        if (reservedSlotId && course?.id) {
+          const slotLockRef = doc(db, "courseSlotLocks", `${course.id}_${reservedSlotId}`);
+          const slotLockSnap = await tx.get(slotLockRef);
+          if (slotLockSnap.exists()) {
+            const slotLockData = slotLockSnap.data() || {};
+            const lockOwner = slotLockData.studentUid || "";
+            const lockEnrollmentId = slotLockData.enrollmentId || "";
+            if (!lockOwner || lockOwner === sessionUser?.uid || lockEnrollmentId === enrollmentDocId) {
+              tx.delete(slotLockRef);
+            }
+          }
+        }
+
+        tx.delete(enrollmentRef);
+      });
       showToast({
         type: "info",
         message: "Your booking has been cancelled. Feel free to enroll again anytime.",
@@ -489,6 +828,43 @@ export default function CourseDetailPage({ params }) {
       setTimeout(() => router.push("/Dashboard"), 1000);
     } catch (error) {
       console.error("Failed to cancel enrollment", error);
+      if (isPermissionError(error)) {
+        try {
+          // Fallback for environments where slot-lock collection rules are not deployed yet.
+          await setDoc(
+            enrollmentRef,
+            {
+              status: "Cancelled",
+              paymentStatus: "cancelled",
+              timeSlot: "",
+              timeSlotLabel: "",
+              timeSlotDay: "",
+              timeSlotDays: [],
+              timeSlotStartTime: "",
+              timeSlotEndTime: "",
+              slotReservationExpiresAt: null,
+              cancelledAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            },
+            { merge: true }
+          );
+
+          if (course?.id && existingEnrollment?.timeSlot) {
+            const slotLockRef = doc(db, "courseSlotLocks", `${course.id}_${existingEnrollment.timeSlot}`);
+            await deleteDoc(slotLockRef).catch(() => {});
+          }
+
+          showToast({
+            type: "info",
+            message:
+              "Enrollment marked as cancelled. You can register again for testing. (Slot lock cleanup may require Firestore rules update.)",
+            duration: 5500,
+          });
+          return;
+        } catch (fallbackError) {
+          console.error("Fallback cancel flow failed", fallbackError);
+        }
+      }
       showToast({ type: "error", message: "Unable to cancel this enrollment. Please try again." });
     }
   }
@@ -1592,30 +1968,121 @@ export default function CourseDetailPage({ params }) {
                   />
                 </label>
 
-                <label style={{ display: "grid", gap: "6px" }}>
+                <div style={{ display: "grid", gap: "8px" }}>
                   <span style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>Preferred time slot</span>
-                  <select
-                    value={timeSlot}
-                    onChange={(event) => setTimeSlot(event.target.value)}
+                  <div
                     style={{
-                      padding: "12px",
+                      border: "1px solid rgba(148,163,184,0.35)",
                       borderRadius: "12px",
-                      border: "1px solid rgba(148,163,184,0.4)",
-                      fontSize: "14px",
                       backgroundColor: "#f8fafc",
-                      color: "#0f172a",
+                      overflow: "hidden",
                     }}
                   >
-                    <option value="" disabled>
-                      Select a schedule option
-                    </option>
-                    {(course.timeSlots || []).map((slot) => (
-                      <option key={slot.id} value={slot.id}>
-                        {slot.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    <p
+                      style={{
+                        margin: 0,
+                        padding: "10px 12px",
+                        borderBottom: "1px solid rgba(148,163,184,0.25)",
+                        fontSize: "12px",
+                        color: "#475569",
+                      }}
+                    >
+                      * All times listed are in your local timezone: {localTimeZone}
+                    </p>
+                    <div
+                      style={{
+                        display: "grid",
+                        gridTemplateColumns: "112px repeat(7, minmax(0, 1fr))",
+                        borderTop: "1px solid rgba(148,163,184,0.2)",
+                      }}
+                    >
+                      <div style={{ borderRight: "1px solid rgba(148,163,184,0.2)", backgroundColor: "#f1f5f9" }} />
+                      {WEEK_COLUMNS.map((day) => (
+                        <div
+                          key={day.day}
+                          style={{
+                            textAlign: "center",
+                            fontSize: "11px",
+                            fontWeight: 700,
+                            color: "#334155",
+                            lineHeight: 1.2,
+                            padding: "8px 0",
+                            borderLeft: "1px solid rgba(148,163,184,0.2)",
+                            backgroundColor: "#f1f5f9",
+                          }}
+                        >
+                          {day.label}
+                        </div>
+                      ))}
+
+                      {TIME_BANDS.map((band) => (
+                        <Fragment key={band.key}>
+                          <div
+                            key={`${band.key}-label`}
+                            style={{
+                              padding: "9px 8px",
+                              borderTop: "1px solid rgba(148,163,184,0.18)",
+                              borderRight: "1px solid rgba(148,163,184,0.2)",
+                              backgroundColor: "#f8fafc",
+                            }}
+                          >
+                            <p style={{ margin: 0, fontSize: "12px", color: "#0f172a", fontWeight: 600 }}>
+                              {band.label}
+                            </p>
+                            <p style={{ margin: 0, fontSize: "11px", color: "#64748b" }}>{band.range}</p>
+                          </div>
+                          {WEEK_COLUMNS.map((day) => {
+                            const cellKey = `${band.key}:${day.day}`;
+                            const slotIds = slotGrid.cellToSlotIds.get(cellKey) || [];
+                            const hasSlot = slotIds.length > 0;
+                            const availableSlotId = slotIds.find((slotId) => !blockedSlotIds.has(slotId)) || "";
+                            const isBlocked = hasSlot && !availableSlotId;
+                            const isSelected = Boolean(
+                              availableSlotId && selectedCellKey === cellKey && timeSlot === availableSlotId
+                            );
+                            return (
+                              <button
+                                key={`${band.key}-${day.day}`}
+                                type="button"
+                                onClick={() => handleGridSelect(cellKey)}
+                                disabled={!availableSlotId}
+                                title={
+                                  !hasSlot
+                                    ? "Not available"
+                                    : isBlocked
+                                    ? "Booked"
+                                    : "Click to choose this time"
+                                }
+                                style={{
+                                  border: "none",
+                                  borderTop: "1px solid rgba(148,163,184,0.18)",
+                                  borderLeft: "1px solid rgba(148,163,184,0.2)",
+                                  minHeight: "36px",
+                                  cursor: availableSlotId ? "pointer" : "not-allowed",
+                                  backgroundColor: isSelected
+                                    ? "#22c55e"
+                                    : availableSlotId
+                                    ? "#5eead4"
+                                    : "#e2e8f0",
+                                  opacity: availableSlotId ? 1 : 0.75,
+                                  transition: "all 0.15s ease",
+                                }}
+                              />
+                            );
+                          })}
+                        </Fragment>
+                      ))}
+                    </div>
+                  </div>
+                  <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>
+                    {selectedSlot ? `Selected: ${selectedSlotLabel}` : "Select one available time from the grid."}
+                  </p>
+                  {noAvailableSlots && (
+                    <span style={{ fontSize: "12px", color: "#b45309" }}>
+                      All current slots are booked. Please check back later for availability.
+                    </span>
+                  )}
+                </div>
 
                 <fieldset style={{ border: "none", padding: 0, margin: 0, display: "grid", gap: "10px" }}>
                   <legend style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a", marginBottom: "4px" }}>
@@ -1648,20 +2115,28 @@ export default function CourseDetailPage({ params }) {
                 <div style={{ display: "flex", flexWrap: "wrap", gap: "10px" }}>
                   <button
                     type="submit"
-                    disabled={!isStudent}
+                    disabled={!isStudent || noAvailableSlots || !timeSlot || blockedSlotIds.has(timeSlot)}
                     style={{
                       flex: "1 1 auto",
                       minWidth: "160px",
                       padding: "12px 18px",
                       borderRadius: "14px",
                       border: "none",
-                      background: isStudent
+                      background: !isStudent || noAvailableSlots || !timeSlot || blockedSlotIds.has(timeSlot)
+                        ? "#94a3b8"
+                        : isStudent
                         ? "linear-gradient(120deg, #0ea5e9, #2563eb)"
                         : "#94a3b8",
                       color: "white",
                       fontWeight: 600,
-                      cursor: isStudent ? "pointer" : "not-allowed",
-                      boxShadow: isStudent ? "0 14px 28px rgba(37,99,235,0.25)" : "none",
+                      cursor:
+                        !isStudent || noAvailableSlots || !timeSlot || blockedSlotIds.has(timeSlot)
+                          ? "not-allowed"
+                          : "pointer",
+                      boxShadow:
+                        !isStudent || noAvailableSlots || !timeSlot || blockedSlotIds.has(timeSlot)
+                          ? "none"
+                          : "0 14px 28px rgba(37,99,235,0.25)",
                     }}
                   >
                     {existingEnrollment

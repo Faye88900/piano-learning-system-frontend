@@ -27,11 +27,22 @@ function hasPaidAccess(enrollment) {
   );
 }
 
+function toMillis(value) {
+  if (!value) return NaN;
+  if (typeof value?.toDate === "function") {
+    const date = value.toDate();
+    const ms = date instanceof Date ? date.getTime() : NaN;
+    return Number.isFinite(ms) ? ms : NaN;
+  }
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
 function getEnrollmentSortTime(entry) {
   const candidates = [entry?.paidAt, entry?.enrolledAt, entry?.updatedAt];
   for (const value of candidates) {
     if (!value) continue;
-    const ms = new Date(value).getTime();
+    const ms = toMillis(value);
     if (Number.isFinite(ms)) return ms;
   }
   return 0;
@@ -1688,6 +1699,86 @@ function StudentAttendance({
   const PAST_EXTENDED_DAYS = 90;
   const now = Date.now();
   const pastLimit = now - (showPast ? PAST_EXTENDED_DAYS : PAST_LIMIT_DAYS) * 24 * 60 * 60 * 1000;
+  const enrollmentActiveFromByCourse = useMemo(() => {
+    const map = new Map();
+    for (const course of enrolledCourses || []) {
+      const enrollment = course?.enrollment || {};
+      const slotActivatedMs = toMillis(enrollment.slotActivatedAt);
+      if (Number.isFinite(slotActivatedMs) && slotActivatedMs > 0) {
+        map.set(course.id, slotActivatedMs);
+        continue;
+      }
+
+      const cancelledMs = toMillis(enrollment.cancelledAt);
+      const enrolledMs = toMillis(enrollment.enrolledAt);
+      const paidMs = toMillis(enrollment.paidAt);
+      const updatedMs = toMillis(enrollment.updatedAt);
+
+      let activeFromMs = Math.max(
+        Number.isFinite(enrolledMs) ? enrolledMs : 0,
+        Number.isFinite(paidMs) ? paidMs : 0
+      );
+      if (
+        Number.isFinite(updatedMs) &&
+        Number.isFinite(cancelledMs) &&
+        updatedMs > cancelledMs
+      ) {
+        activeFromMs = Math.max(activeFromMs, updatedMs);
+      }
+
+      map.set(course.id, activeFromMs > 0 ? activeFromMs : 0);
+    }
+    return map;
+  }, [enrolledCourses]);
+
+  function normalizeEnrollmentWeekdays(rawDays) {
+    if (!Array.isArray(rawDays)) return [];
+    const indices = new Set();
+    for (const value of rawDays) {
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed)) continue;
+      if (parsed >= 0 && parsed <= 6) {
+        indices.add(parsed);
+      } else if (parsed >= 1 && parsed <= 7) {
+        indices.add(parsed % 7);
+      }
+    }
+    return Array.from(indices);
+  }
+
+  const enrollmentSlotCriteriaByCourse = useMemo(() => {
+    const map = new Map();
+    for (const course of enrolledCourses || []) {
+      const enrollment = course?.enrollment || {};
+      const dayLabel = String(enrollment.timeSlotDay || "").trim();
+      const fromStoredDays = normalizeEnrollmentWeekdays(enrollment.timeSlotDays);
+      const dayIndexes = fromStoredDays.length ? fromStoredDays : parseWeekdayIndexes(dayLabel);
+      map.set(course.id, {
+        dayIndexes,
+        startTime: String(enrollment.timeSlotStartTime || "").trim(),
+        endTime: String(enrollment.timeSlotEndTime || "").trim(),
+      });
+    }
+    return map;
+  }, [enrolledCourses]);
+
+  function sessionMatchesSlotCriteria(session, criteria) {
+    if (!criteria) return true;
+    const expectedStart = criteria.startTime || "";
+    const expectedEnd = criteria.endTime || "";
+    const expectedDays = Array.isArray(criteria.dayIndexes) ? criteria.dayIndexes : [];
+    const sessionStart = String(session?.startTime || "").trim();
+    const sessionEnd = String(session?.endTime || "").trim();
+
+    if (expectedStart && sessionStart && sessionStart !== expectedStart) return false;
+    if (expectedEnd && sessionEnd && sessionEnd !== expectedEnd) return false;
+    if (!expectedDays.length || !session?.date) return true;
+
+    const sessionTime = new Date(`${session.date}T${session.startTime || "00:00"}`).getTime();
+    if (Number.isNaN(sessionTime)) return true;
+    const sessionDay = new Date(sessionTime).getDay();
+    return expectedDays.includes(sessionDay);
+  }
 
   const relevantSessions = (lessonSessions || [])
     .filter((session) => {
@@ -1696,6 +1787,10 @@ function StudentAttendance({
       if (!session?.date) return true;
       const sessionTime = new Date(`${session.date}T${session.startTime || "00:00"}`).getTime();
       if (Number.isNaN(sessionTime)) return true;
+      const enrollmentActiveFrom = enrollmentActiveFromByCourse.get(session.courseId) || 0;
+      if (enrollmentActiveFrom && sessionTime < enrollmentActiveFrom - 60 * 1000) return false;
+      const criteria = enrollmentSlotCriteriaByCourse.get(session.courseId);
+      if (sessionTime >= now && !sessionMatchesSlotCriteria(session, criteria)) return false;
       return sessionTime >= pastLimit;
     })
     .sort((a, b) => {
@@ -1868,10 +1963,31 @@ function StudentAttendance({
     return computed.toLocaleString();
   }
 
-  function openRequestForm(session) {
-    setActiveSessionId(session.id);
-    setRequestDate(session.date || '');
-    setRequestTime(session.startTime || '');
+  function toDateInputValue(dateValue) {
+    if (!(dateValue instanceof Date) || Number.isNaN(dateValue.getTime())) return "";
+    const year = dateValue.getFullYear();
+    const month = String(dateValue.getMonth() + 1).padStart(2, "0");
+    const day = String(dateValue.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  function openRequestForm(slot) {
+    const targetSession = slot?.requestTargetSession;
+    if (!targetSession?.id) return;
+    const preferredDate =
+      slot?.nextSession?.date ||
+      slot?.estimatedNextLessonDateValue ||
+      targetSession.date ||
+      "";
+    const preferredTime =
+      slot?.nextSession?.startTime ||
+      slot?.preferredStartTime ||
+      targetSession.startTime ||
+      "";
+
+    setActiveSessionId(targetSession.id);
+    setRequestDate(preferredDate);
+    setRequestTime(preferredTime);
     setRequestMessage('');
   }
 
@@ -1912,19 +2028,69 @@ function StudentAttendance({
       dayLabel && startTime && endTime
         ? `${dayLabel} ${startTime} - ${endTime}`
         : enrollment.timeSlotLabel || "Schedule pending";
+    const slotCriteria =
+      enrollmentSlotCriteriaByCourse.get(course.id) || {
+        dayIndexes: parseWeekdayIndexes(dayLabel),
+        startTime,
+        endTime,
+      };
     let nextSession = null;
     let nextSessionTime = Number.POSITIVE_INFINITY;
     let latestSession = null;
     let latestSessionTime = Number.NEGATIVE_INFINITY;
     let undatedSession = null;
+    let fallbackLatestSession = null;
+    let fallbackLatestSessionTime = Number.NEGATIVE_INFINITY;
+    let fallbackUndatedSession = null;
+    const enrollmentActiveFrom = enrollmentActiveFromByCourse.get(course.id) || 0;
     for (const session of lessonSessions || []) {
       if (session?.courseId !== course.id || session?.archived) continue;
+      const createdAtMs = toMillis(session?.createdAt);
+      const sessionHasDate = Boolean(session?.date);
+      let sessionTime = Number.NaN;
+      if (sessionHasDate) {
+        sessionTime = new Date(`${session.date}T${session.startTime || "00:00"}`).getTime();
+      }
+      const isAfterEnrollmentActivation = !enrollmentActiveFrom
+        ? true
+        : sessionHasDate
+        ? Number.isFinite(sessionTime) && sessionTime >= enrollmentActiveFrom - 60 * 1000
+        : !Number.isFinite(createdAtMs) || createdAtMs >= enrollmentActiveFrom - 60 * 1000;
+
+      if (isAfterEnrollmentActivation) {
+        if (!sessionHasDate) {
+          if (!fallbackUndatedSession) fallbackUndatedSession = session;
+        } else if (Number.isFinite(sessionTime) && sessionTime > fallbackLatestSessionTime) {
+          fallbackLatestSession = session;
+          fallbackLatestSessionTime = sessionTime;
+        }
+      }
+
+      if (!sessionMatchesSlotCriteria(session, slotCriteria)) continue;
       if (!session?.date) {
-        if (!undatedSession) undatedSession = session;
+        if (!fallbackUndatedSession && isAfterEnrollmentActivation) fallbackUndatedSession = session;
+      } else {
+        if (
+          isAfterEnrollmentActivation &&
+          Number.isFinite(sessionTime) &&
+          sessionTime > fallbackLatestSessionTime
+        ) {
+          fallbackLatestSession = session;
+          fallbackLatestSessionTime = sessionTime;
+        }
+      }
+
+      if (!session?.date) {
+        if (
+          !undatedSession &&
+          (!enrollmentActiveFrom || !Number.isFinite(createdAtMs) || createdAtMs >= enrollmentActiveFrom - 60 * 1000)
+        ) {
+          undatedSession = session;
+        }
         continue;
       }
-      const sessionTime = new Date(`${session.date}T${session.startTime || "00:00"}`).getTime();
       if (Number.isNaN(sessionTime)) continue;
+      if (enrollmentActiveFrom && sessionTime < enrollmentActiveFrom - 60 * 1000) continue;
       if (sessionTime >= now && sessionTime < nextSessionTime) {
         nextSession = session;
         nextSessionTime = sessionTime;
@@ -1934,7 +2100,13 @@ function StudentAttendance({
         latestSessionTime = sessionTime;
       }
     }
-    const requestTargetSession = nextSession || latestSession || undatedSession || null;
+    const requestTargetSession =
+      nextSession ||
+      latestSession ||
+      undatedSession ||
+      fallbackLatestSession ||
+      fallbackUndatedSession ||
+      null;
     const linkedRequest = requestTargetSession ? requestsBySession.get(requestTargetSession.id) : null;
     const linkedRequestStyle =
       linkedRequest && requestStatusStyles[linkedRequest.status || "pending"];
@@ -1955,6 +2127,7 @@ function StudentAttendance({
       ? ""
       : "Meeting link pending from instructor.";
     const estimatedNextLesson = nextSession ? null : getNextFixedSlotDate(dayLabel, startTime);
+    const estimatedNextLessonDateValue = estimatedNextLesson ? toDateInputValue(estimatedNextLesson) : "";
     const nextSessionLabel = nextSession
       ? formatSessionDateTime(nextSession)
       : estimatedNextLesson
@@ -1973,6 +2146,8 @@ function StudentAttendance({
       meetingLink,
       isPaid,
       joinDisabledReason,
+      preferredStartTime: startTime,
+      estimatedNextLessonDateValue,
     };
   });
 
@@ -2045,10 +2220,11 @@ function StudentAttendance({
                   >
                     {slot.slotLabel}
                   </span>
-                  {slot.requestTargetSession && !slot.linkedRequest && (
+                  {slot.requestTargetSession &&
+                    (!slot.linkedRequest || (slot.linkedRequest.status || "pending") !== "pending") && (
                     <button
                       type="button"
-                      onClick={() => openRequestForm(slot.requestTargetSession)}
+                      onClick={() => openRequestForm(slot)}
                       style={{
                         marginTop: "2px",
                         padding: "8px 14px",
@@ -2144,7 +2320,7 @@ function StudentAttendance({
 
               {slot.requestTargetSession &&
                 activeSessionId === slot.requestTargetSession.id &&
-                !slot.linkedRequest && (
+                (!slot.linkedRequest || (slot.linkedRequest.status || "pending") !== "pending") && (
                 <div
                   style={{
                     borderRadius: "14px",

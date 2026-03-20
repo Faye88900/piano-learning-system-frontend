@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import {addDoc,collection,deleteDoc,doc,onSnapshot,orderBy,query,serverTimestamp,updateDoc,} from "firebase/firestore";
+import {addDoc,collection,onSnapshot,orderBy,query,serverTimestamp,updateDoc,doc,} from "firebase/firestore";
 import { getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { signOut } from "firebase/auth";
 import { auth, db, storage } from "@/lib/firebase";
@@ -17,39 +17,56 @@ const RESOURCE_TYPES = [
   { value: "link", label: "External Link" },
 ];
 
-const TYPE_ICONS = {
-  video: "🎬",
-  sheet: "🎼",
-  assignment: "📝",
-  link: "🔗",
-};
+function hasPaidAccess(enrollment) {
+  if (!enrollment) return false;
+  const enrollmentStatus =
+    typeof enrollment.status === "string" ? enrollment.status.toLowerCase() : "";
+  return enrollment.paymentStatus === "paid" || enrollmentStatus === "paid";
+}
+
+function normalizeDate(value) {
+  if (!value) return null;
+  if (typeof value.toDate === "function") return value.toDate();
+  if (value instanceof Date) return value;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatDateTime(value) {
+  const parsed = normalizeDate(value);
+  if (!parsed) return "N/A";
+  return parsed.toLocaleString();
+}
+
+function getSlotLabel(enrollment) {
+  const dayLabel = (enrollment?.timeSlotDay || "").trim();
+  const startTime = (enrollment?.timeSlotStartTime || "").trim();
+  const endTime = (enrollment?.timeSlotEndTime || "").trim();
+  if (dayLabel && startTime && endTime) return `${dayLabel} ${startTime} - ${endTime}`;
+  return enrollment?.timeSlotLabel || "Schedule pending";
+}
+
+function getEnrollmentSortMs(entry) {
+  const candidates = [entry?.enrolledAt, entry?.updatedAt, entry?.createdAt];
+  for (const candidate of candidates) {
+    const parsed = normalizeDate(candidate);
+    if (parsed) return parsed.getTime();
+  }
+  return 0;
+}
+
+function isMissingMeetingLink(enrollment) {
+  return !(enrollment?.meetingLink || "").trim();
+}
 
 export default function TeacherDashboardPage() {
-  
   const router = useRouter();
   const { sessionUser, loading } = useSessionUser();
+
   const [materials, setMaterials] = useState([]);
   const [enrollments, setEnrollments] = useState([]);
   const [meetingDrafts, setMeetingDrafts] = useState({});
   const [savingMeetingId, setSavingMeetingId] = useState(null);
-
-  const summary = useMemo(() => {
-  const total = materials.length;
-  const assignments = materials.filter((item) => item.type === "assignment").length;
-  const videos = materials.filter((item) => item.type === "video").length;
-  const lastUpdated =materials.length > 0
-        ? materials
-            .map((item) => new Date(item.createdAt || item.updatedAt || 0).getTime())
-            .filter((time) => Number.isFinite(time))
-            .sort((a, b) => b - a)[0]
-        : null;
-    return {
-      totalResources: total,
-      assignmentCount: assignments,
-      videoCount: videos,
-      lastUpdated: lastUpdated ? new Date(lastUpdated).toLocaleString() : "N/A",
-    };
-  }, [materials]);
 
   const [courseId, setCourseId] = useState(courseCatalog[0]?.id ?? "");
   const [title, setTitle] = useState("");
@@ -59,6 +76,12 @@ export default function TeacherDashboardPage() {
   const [visibleToStudents, setVisibleToStudents] = useState(true);
   const [file, setFile] = useState(null);
   const [isUploading, setIsUploading] = useState(false);
+
+  const [expandedCourseId, setExpandedCourseId] = useState(courseCatalog[0]?.id ?? "");
+  const [meetingCourseFilter, setMeetingCourseFilter] = useState("all");
+  const [meetingSearch, setMeetingSearch] = useState("");
+  const [meetingStatusFilter, setMeetingStatusFilter] = useState("pending");
+  const [expandedMeetingGroups, setExpandedMeetingGroups] = useState({});
 
   useEffect(() => {
     if (loading) return;
@@ -77,24 +100,17 @@ export default function TeacherDashboardPage() {
       return;
     }
 
-    const enrollmentsQuery = query(
-      collection(db, "enrollments"),
-      orderBy("enrolledAt", "desc")
-    );
-
+    const enrollmentsQuery = query(collection(db, "enrollments"), orderBy("enrolledAt", "desc"));
     const unsubscribe = onSnapshot(
       enrollmentsQuery,
       (snapshot) => {
         const records = snapshot.docs.map((docSnapshot) => {
           const data = docSnapshot.data();
-          const enrolledAt =
-            data.enrolledAt && typeof data.enrolledAt.toDate === "function"
-              ? data.enrolledAt.toDate().toISOString()
-              : data.enrolledAt ?? null;
           return {
             docId: docSnapshot.id,
             ...data,
-            enrolledAt,
+            enrolledAt: normalizeDate(data.enrolledAt),
+            updatedAt: normalizeDate(data.updatedAt),
           };
         });
         setEnrollments(records);
@@ -108,53 +124,25 @@ export default function TeacherDashboardPage() {
     return () => unsubscribe();
   }, [sessionUser]);
 
-  async function handleSaveMeetingLink(enrollment) {
-    if (!enrollment?.docId) return;
-    const draft = (meetingDrafts[enrollment.docId] ?? enrollment.meetingLink ?? "").trim();
-    setSavingMeetingId(enrollment.docId);
-    try {
-      await updateDoc(doc(db, "enrollments", enrollment.docId), {
-        meetingLink: draft,
-        meetingLinkUpdatedAt: serverTimestamp(),
-        meetingLinkUpdatedBy: sessionUser?.email ?? "instructor",
-      });
-    } catch (error) {
-      console.error("Failed to update meeting link", error);
-      alert("Unable to save meeting link. Please try again.");
-    } finally {
-      setSavingMeetingId(null);
-    }
-  }
-
-  //read-time material
   useEffect(() => {
-    if (!sessionUser) return;
+    if (!sessionUser) {
+      setMaterials([]);
+      return;
+    }
 
-    const materialsRef = collection(db, "materials");
-    const materialsQuery = query(materialsRef, orderBy("createdAt", "desc"));
-
+    const materialsQuery = query(collection(db, "materials"), orderBy("createdAt", "desc"));
     const unsubscribe = onSnapshot(
       materialsQuery,
       (snapshot) => {
         const nextMaterials = snapshot.docs.map((docSnapshot) => {
           const data = docSnapshot.data();
-          const createdAt =
-            data.createdAt && typeof data.createdAt.toDate === "function"
-              ? data.createdAt.toDate()
-              : data.createdAt ?? null;
-          const updatedAt =
-            data.updatedAt && typeof data.updatedAt.toDate === "function"
-              ? data.updatedAt.toDate()
-              : data.updatedAt ?? null;
-
           return {
             id: docSnapshot.id,
             ...data,
-            createdAt,
-            updatedAt,
+            createdAt: normalizeDate(data.createdAt),
+            updatedAt: normalizeDate(data.updatedAt),
           };
         });
-
         setMaterials(nextMaterials);
       },
       (error) => {
@@ -165,15 +153,130 @@ export default function TeacherDashboardPage() {
     return () => unsubscribe();
   }, [sessionUser]);
 
+  const summary = useMemo(() => {
+    const paidEnrollments = enrollments.filter((entry) => hasPaidAccess(entry));
+    const uniqueStudents = new Set(
+      paidEnrollments
+        .map((entry) => entry.studentUid || entry.studentEmail || "")
+        .filter(Boolean)
+    );
+
+    const pendingMeetingLinks = paidEnrollments.filter((entry) => !(entry.meetingLink || "").trim()).length;
+
+    return {
+      totalResources: materials.length,
+      assignmentCount: materials.filter((item) => item.type === "assignment").length,
+      publishedCount: materials.filter((item) => item.visibleToStudents).length,
+      paidEnrollmentCount: paidEnrollments.length,
+      activeStudentCount: uniqueStudents.size,
+      pendingMeetingLinks,
+    };
+  }, [materials, enrollments]);
+
+  const courseSnapshots = useMemo(() => {
+    return courseCatalog.map((course) => {
+      const courseMaterials = materials.filter((item) => item.courseId === course.id);
+      const paidEnrollments = enrollments.filter(
+        (entry) => entry.courseId === course.id && hasPaidAccess(entry)
+      );
+
+      const latestUpdateMs = courseMaterials
+        .map((item) => normalizeDate(item.updatedAt || item.createdAt)?.getTime() ?? 0)
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .sort((a, b) => b - a)[0];
+
+      const moduleCount = Array.isArray(course.syllabus) ? course.syllabus.length : 0;
+      const readinessBase = moduleCount ? moduleCount * 2 : 1;
+      const readinessScore = Math.min(100, Math.round((courseMaterials.length / readinessBase) * 100));
+
+      return {
+        course,
+        moduleCount,
+        materialsCount: courseMaterials.length,
+        assignmentsCount: courseMaterials.filter((item) => item.type === "assignment").length,
+        videosCount: courseMaterials.filter((item) => item.type === "video").length,
+        paidEnrollmentCount: paidEnrollments.length,
+        latestUpdate: latestUpdateMs ? formatDateTime(latestUpdateMs) : "N/A",
+        readinessScore,
+      };
+    });
+  }, [materials, enrollments]);
+
+  const scopedMeetingEnrollments = useMemo(() => {
+    const search = meetingSearch.trim().toLowerCase();
+    return [...enrollments]
+      .filter((entry) => meetingCourseFilter === "all" || entry.courseId === meetingCourseFilter)
+      .filter((entry) => {
+        if (!search) return true;
+        const haystack = `${entry.studentName || ""} ${entry.studentEmail || ""} ${entry.courseTitle || ""}`.toLowerCase();
+        return haystack.includes(search);
+      })
+      .sort((a, b) => getEnrollmentSortMs(b) - getEnrollmentSortMs(a));
+  }, [enrollments, meetingCourseFilter, meetingSearch]);
+
+  const filteredEnrollments = useMemo(() => {
+    if (meetingStatusFilter === "all") return scopedMeetingEnrollments;
+    return scopedMeetingEnrollments.filter((entry) => isMissingMeetingLink(entry));
+  }, [scopedMeetingEnrollments, meetingStatusFilter]);
+
+  const pendingMeetingCountInScope = useMemo(
+    () => scopedMeetingEnrollments.filter((entry) => isMissingMeetingLink(entry)).length,
+    [scopedMeetingEnrollments]
+  );
+
+  const groupedMeetingEnrollments = useMemo(() => {
+    const groups = new Map();
+    for (const entry of filteredEnrollments) {
+      const course = courseCatalog.find((item) => item.id === entry.courseId);
+      const courseId = entry.courseId || course?.id || "unknown";
+      const courseTitle = course?.title || entry.courseTitle || "Other courses";
+      const key = `${courseId}::${courseTitle}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          courseId,
+          courseTitle,
+          items: [],
+          pendingCount: 0,
+        });
+      }
+      const group = groups.get(key);
+      group.items.push(entry);
+      if (isMissingMeetingLink(entry)) group.pendingCount += 1;
+    }
+
+    const courseOrder = new Map(courseCatalog.map((item, index) => [item.id, index]));
+    return Array.from(groups.values()).sort((a, b) => {
+      const indexA = courseOrder.has(a.courseId) ? courseOrder.get(a.courseId) : Number.MAX_SAFE_INTEGER;
+      const indexB = courseOrder.has(b.courseId) ? courseOrder.get(b.courseId) : Number.MAX_SAFE_INTEGER;
+      if (indexA !== indexB) return indexA - indexB;
+      return a.courseTitle.localeCompare(b.courseTitle);
+    });
+  }, [filteredEnrollments]);
+
+  useEffect(() => {
+    setExpandedMeetingGroups((prev) => {
+      if (!groupedMeetingEnrollments.length) return {};
+      const next = {};
+      for (const group of groupedMeetingEnrollments) {
+        if (Object.prototype.hasOwnProperty.call(prev, group.key)) {
+          next[group.key] = prev[group.key];
+        } else {
+          next[group.key] = meetingCourseFilter !== "all";
+        }
+      }
+      return next;
+    });
+  }, [groupedMeetingEnrollments, meetingCourseFilter]);
+
   function resetForm() {
     setTitle("");
     setDescription("");
     setUrl("");
     setVisibleToStudents(true);
     setFile(null);
-    setIsUploading(false);
   }
-//update materials
+
   async function handleSubmit(event) {
     event.preventDefault();
 
@@ -184,15 +287,11 @@ export default function TeacherDashboardPage() {
 
     let finalUrl = url.trim();
     const originalFileName = file?.name ?? null;
-
     setIsUploading(true);
 
     try {
       if (file) {
-        const storageRef = ref(
-          storage,
-          "teacher-resources/" + courseId + "/" + Date.now() + "-" + file.name
-        );
+        const storageRef = ref(storage, `teacher-resources/${courseId}/${Date.now()}-${file.name}`);
         await uploadBytes(storageRef, file);
         finalUrl = await getDownloadURL(storageRef);
       }
@@ -222,6 +321,25 @@ export default function TeacherDashboardPage() {
     }
   }
 
+  async function handleSaveMeetingLink(enrollment) {
+    if (!enrollment?.docId) return;
+    const draft = (meetingDrafts[enrollment.docId] ?? enrollment.meetingLink ?? "").trim();
+    setSavingMeetingId(enrollment.docId);
+
+    try {
+      await updateDoc(doc(db, "enrollments", enrollment.docId), {
+        meetingLink: draft,
+        meetingLinkUpdatedAt: serverTimestamp(),
+        meetingLinkUpdatedBy: sessionUser?.email ?? "instructor",
+      });
+    } catch (error) {
+      console.error("Failed to update meeting link", error);
+      alert("Unable to save meeting link. Please try again.");
+    } finally {
+      setSavingMeetingId(null);
+    }
+  }
+
   async function handleLogout() {
     try {
       await signOut(auth);
@@ -232,665 +350,1168 @@ export default function TeacherDashboardPage() {
     }
   }
 
+  function handleOpenUploadForCourse(nextCourseId) {
+    setCourseId(nextCourseId);
+    const uploadSection = document.getElementById("upload-section");
+    if (uploadSection) {
+      uploadSection.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  }
+
+  function toggleMeetingGroup(groupKey) {
+    setExpandedMeetingGroups((prev) => ({
+      ...prev,
+      [groupKey]: !prev[groupKey],
+    }));
+  }
+
   if (loading || !sessionUser || sessionUser.role !== "teacher") return null;
 
-  const teacherDisplayName =sessionUser?.displayName || sessionUser?.name || sessionUser?.email || "Teacher";
+  const teacherDisplayName =
+    sessionUser?.displayName || sessionUser?.name || sessionUser?.email || "Teacher";
   const teacherInitial = teacherDisplayName.slice(0, 1).toUpperCase();
-  const teacherEmail = sessionUser?.email ?? "";
   const firstName = teacherDisplayName.split(" ")[0] || teacherDisplayName;
-
-  const sidebarStats = [
-    { label: "Resources", value: summary.totalResources },
-    { label: "Assignments", value: summary.assignmentCount },
-    { label: "Videos", value: summary.videoCount },
-  ];
-
-  const heroStats = [
-    { label: "Total resources", value: summary.totalResources },
-    { label: "Assignments", value: summary.assignmentCount },
-    { label: "Video lessons", value: summary.videoCount },
-    { label: "Last update", value: summary.lastUpdated },
-  ];
-
-  const navLinks = [
-    { label: "Upload resource", href: "#upload", anchor: true, icon: "🗂️", description: "Add new course materials" },
-    { label: "Practice logs", href: "/teacher/practice-logs", icon: "🎧", description: "Review student sessions" },
-    { label: "Schedule & attendance", href: "/teacher/schedule", icon: "🗓️", description: "Manage lesson times" },
-    { label: "Resources", href: "/teacher/resources", icon: "📚", description: "Go to library" },
+  const heroSecondaryButtonStyle = {
+    padding: "10px 14px",
+    background: "#ffffff",
+    color: "#0f172a",
+    border: "1px solid rgba(226, 232, 240, 0.88)",
+    borderRadius: "12px",
+    boxShadow: "0 10px 22px rgba(15, 23, 42, 0.18)",
+    textDecoration: "none",
+    fontSize: "13px",
+    fontWeight: 600,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "8px",
+    lineHeight: 1,
+  };
+  const heroCtaIconStyle = {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "16px",
+    fontSize: "14px",
+    lineHeight: 1,
+  };
+  const heroCtaLabelStyle = {
+    display: "inline-flex",
+    alignItems: "center",
+    lineHeight: 1.2,
+  };
+  const insightActionButtonStyle = {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: "8px 12px",
+    borderRadius: "10px",
+    border: "1px solid rgba(37, 99, 235, 0.32)",
+    background: "linear-gradient(120deg, #2563eb, #1d4ed8)",
+    boxShadow: "0 10px 20px rgba(37, 99, 235, 0.22)",
+    fontSize: "12px",
+    fontWeight: 700,
+    color: "#ffffff",
+    textDecoration: "none",
+    width: "fit-content",
+  };
+  const hiddenResources = Math.max(0, summary.totalResources - summary.publishedCount);
+  const averageReadiness = courseSnapshots.length
+    ? Math.round(
+        courseSnapshots.reduce((acc, course) => acc + (Number(course.readinessScore) || 0), 0) /
+          courseSnapshots.length
+      )
+    : 0;
+  const topCourseByStudents =
+    courseSnapshots.length > 0
+      ? [...courseSnapshots].sort((a, b) => b.paidEnrollmentCount - a.paidEnrollmentCount)[0]
+      : null;
+  const quickInsights = [
+    {
+      label: "Pending meeting links",
+      value: summary.pendingMeetingLinks,
+      note: "Students still missing a saved meeting URL.",
+      actionLabel: "Complete now",
+      actionHref: "#meeting-links",
+    },
+    {
+      label: "Hidden resources",
+      value: hiddenResources,
+      note: "Materials not visible to students yet.",
+      actionLabel: "Review visibility",
+      actionHref: "/teacher/resources",
+      isLink: true,
+    },
+    {
+      label: "Average readiness",
+      value: `${averageReadiness}%`,
+      note: "Average delivery readiness across courses.",
+      actionLabel: "Open modules",
+      actionHref: "#course-modules",
+    },
+    {
+      label: "Top course by students",
+      value: topCourseByStudents?.course?.title || "No enrollments",
+      note: topCourseByStudents
+        ? `${topCourseByStudents.paidEnrollmentCount} paid students`
+        : "No paid enrollments yet",
+      actionLabel: "Open schedule",
+      actionHref: "/teacher/schedule",
+      isLink: true,
+    },
   ];
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background: "linear-gradient(160deg, #eef2ff 0%, #e0f2fe 45%, #f8fafc 100%)",
-        fontFamily: "'Inter', 'Segoe UI', Arial, sans-serif",
-        padding: "48px 24px",
-      }}
-    >
-      <div
-        style={{
-          maxWidth: "1260px",
-          margin: "0 auto",
-          display: "grid",
-          rowGap: "24px",
-          columnGap: "64px",
-          gridTemplateColumns: "340px minmax(0, 1fr)",
-          alignItems: "start",
-        }}
-      >
-        <aside
-          style={{
-            borderRadius: "32px",
-            background: "linear-gradient(180deg, #f1f5ff, #ffffff)",
-            color: "#0f172a",
-            padding: "24px",
-            boxShadow: "0 30px 65px rgba(15,23,42,0.22)",
-            display: "grid",
-            gap: "18px",
-            position: "sticky",
-            top: "24px",
-            height: "fit-content",
-            zIndex: 2,
-            overflow: "hidden",
-          }}
-        >
-          <div style={{ display: "flex", gap: "16px", alignItems: "center" }}>
-            <div
-              style={{
-                width: "56px",
-                height: "56px",
-                borderRadius: "16px",
-                background: "linear-gradient(135deg, #e0f2fe, #a5f3fc)",
-                color: "#0f172a",
-                fontSize: "26px",
-                fontWeight: 700,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                boxShadow: "0 18px 40px rgba(148,163,184,0.35)",
-              }}
-            >
-              {teacherInitial}
-            </div>
-            <div>
-              <p style={{ margin: 0, fontSize: "12px", letterSpacing: "0.18em", color: "#2563eb" }}>TEACHER</p>
-              <h2 style={{ margin: "6px 0 2px", fontSize: "20px", color: "#0f172a" }}>{teacherDisplayName}</h2>
-             
-            </div>
-          </div>
-
-         <div style={{ display: "grid", gap: "8px" }}>
-            {navLinks.map((link) => {
-              const CardTag = link.anchor ? "a" : Link;
-              return (
-                <CardTag
-                  key={link.label}
-                  href={link.href}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "10px",
-                    padding: "10px 16px",
-                    borderRadius: "14px",
-                    border: "1px solid rgba(148,163,184,0.15)",
-                    backgroundColor: "white",
-                    color: "#0f172a",
-                    textDecoration: "none",
-                    boxShadow: "0 8px 18px rgba(148,163,184,0.14)",
-                    width: "calc(100% - 16px)",
-                    margin: "0 auto",
-                    boxSizing: "border-box",
-                  }}
-                >
-                  <span style={{ fontSize: "16px" }}>{link.icon}</span>
-                  <div style={{ flex: 1 }}>
-                    <strong style={{ display: "block", fontSize: "13px" }}>{link.label}</strong>
-                    <span style={{ fontSize: "12px", color: "#94a3b8", display: "block" }}>
-                      {link.description}
-                    </span>
-                  </div>
-                  <span aria-hidden="true" style={{ color: "#cbd5f5", fontSize: "12px" }}>
-                    
-                  </span>
-                </CardTag>
-              );
-            })}
-          </div>
-
-          <div
-            style={{
-              display: "grid",
-              gap: "12px",
-              borderTop: "1px solid rgba(148,163,184,0.25)",
-              paddingTop: "18px",
-            }}
-          >
-            <p style={{ fontSize: "12px", letterSpacing: "0.12em", color: "#94a3b8" }}>QUICK STATS</p>
-            <div style={{ display: "grid", gap: "12px" }}>
-              {sidebarStats.map((stat) => (
-                <div
-                  key={stat.label}
-                  style={{
-                    borderRadius: "14px",
-                    padding: "12px 18px",
-                    backgroundColor: "rgba(255,255,255,0.9)",
-                    border: "1px solid rgba(148,163,184,0.25)",
-                    display: "grid",
-                    gridTemplateColumns: "auto auto",
-                    alignItems: "center",
-                    boxShadow: "0 8px 20px rgba(148,163,184,0.18)",
-                    width: "calc(100% - 16px)",
-                    margin: "0 auto",
-                  }}
-                >
-                  <span style={{ fontSize: "13px", color: "#475569" }}>{stat.label}</span>
-                  <strong style={{ justifySelf: "end", color: "#0f172a", fontSize: "18px" }}>
-                    {stat.value}
-                  </strong>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <button
-            onClick={handleLogout}
-            style={{
-              marginTop: "8px",
-              padding: "12px 18px",
-              borderRadius: "14px",
-              border: "none",
-              background: "linear-gradient(120deg, #f87171, #ef4444)",
-              color: "white",
-              fontWeight: 600,
-              cursor: "pointer",
-              boxShadow: "0 16px 40px rgba(239,68,68,0.25)",
-              width: "100%",
-            }}
-          >
-            Log out
-          </button>
-        </aside>
-        <div style={{ display: "grid", gap: "24px", paddingLeft: "24px" }}>
-          <section
-            style={{
-              borderRadius: "28px",
-              padding: "28px",
-              background: "linear-gradient(135deg, rgba(15,23,42,0.9), rgba(59,130,246,0.8))",
-              color: "white",
-              boxShadow: "0 18px 45px rgba(15,23,42,0.2)",
-              border: "1px solid rgba(148,163,184,0.2)",
-              display: "grid",
-              gap: "24px",
-              position: "relative",
-              overflow: "hidden",
-              marginLeft: "24px",
-            }}
-          >
-            <div style={{ display: "grid", gap: "10px" }}>
-              <p style={{ fontSize: "12px", letterSpacing: "0.18em", margin: 0, color: "#a5f3fc" }}>
-                RESOURCE COMMAND CENTER
-              </p>
-              <h1 style={{ margin: 0, fontSize: "30px" }}>Welcome back, {firstName}!</h1>
-              <p style={{ margin: 0, fontSize: "14px", color: "rgba(226,232,240,0.85)" }}>
-                Plan lessons, upload assignments, and keep every course stocked with updated materials.
-              </p>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: "12px", marginTop: "12px" }}>
-                <a
-                  href="#upload"
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    padding: "12px 20px",
-                    borderRadius: "999px",
-                    border: "1px solid rgba(255,255,255,0.4)",
-                    backgroundColor: "rgba(14,165,233,0.2)",
-                    color: "white",
-                    fontWeight: 600,
-                    textDecoration: "none",
-                  }}
-                >
-                  Upload new resource
-                </a>
-                <Link
-                  href="/teacher/practice-logs"
-                  style={{
-                    display: "inline-flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    padding: "12px 20px",
-                    borderRadius: "999px",
-                    border: "1px solid rgba(255,255,255,0.25)",
-                    backgroundColor: "rgba(15,23,42,0.4)",
-                    color: "white",
-                    fontWeight: 600,
-                    textDecoration: "none",
-                  }}
-                >
-                  Review practice logs
-                </Link>
+    <main className="teacher-dashboard">
+      <div className="shell">
+        <section className="hero-card">
+          <div className="hero-top">
+            <div className="teacher-chip">
+              <span className="avatar">{teacherInitial}</span>
+              <div>
+                <p className="eyebrow">Teacher Command Center</p>
+                <h1>Welcome back, {firstName}</h1>
+               
               </div>
             </div>
-            <div
-              style={{
-                display: "grid",
-                gap: "12px",
-                gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-              }}
-            >
-              {heroStats.map((stat, index) => (
-                <SummaryCard
-                  key={stat.label}
-                  label={stat.label}
-                  value={stat.value}
-                  accent={index !== heroStats.length - 1}
-                />
-              ))}
+            <button className="danger-btn" onClick={handleLogout}>
+              Log out
+            </button>
+          </div>
+
+          <div className="hero-actions">
+            <a href="#upload-section" className="primary-cta">
+              Publish resource
+            </a>
+            <Link href="/teacher/schedule" className="ghost-cta" style={heroSecondaryButtonStyle}>
+              <span aria-hidden="true" style={heroCtaIconStyle}>🗓</span>
+              <span style={heroCtaLabelStyle}>Manage schedule</span>
+            </Link>
+            <Link href="/teacher/practice-logs" className="ghost-cta" style={heroSecondaryButtonStyle}>
+              <span aria-hidden="true" style={heroCtaIconStyle}>📈</span>
+              <span style={heroCtaLabelStyle}>Review practice logs</span>
+            </Link>
+            <Link href="/teacher/resources" className="ghost-cta" style={heroSecondaryButtonStyle}>
+              <span aria-hidden="true" style={heroCtaIconStyle}>📚</span>
+              <span style={heroCtaLabelStyle}>Open resource library</span>
+            </Link>
+          </div>
+
+          <div className="metric-grid">
+            <MetricCard label="Active students" value={summary.activeStudentCount} />
+            <MetricCard label="Paid enrollments" value={summary.paidEnrollmentCount} />
+            <MetricCard label="Resources" value={summary.totalResources} />
+            <MetricCard label="Pending meeting links" value={summary.pendingMeetingLinks} tone="warning" />
+          </div>
+        </section>
+
+        <section className="insight-panel">
+          <div className="panel-header">
+            <p className="eyebrow">Today focus</p>
+            <h2>Quick priorities</h2>
+            <p>A compact view of what needs your attention right now.</p>
+          </div>
+          <div className="insight-grid">
+            {quickInsights.map((item) => (
+              <article key={item.label} className="insight-card">
+                <p className="insight-label">{item.label}</p>
+                <strong className="insight-value">{item.value}</strong>
+                <p className="insight-note">{item.note}</p>
+                {item.isLink ? (
+                  <Link href={item.actionHref} className="insight-action" style={insightActionButtonStyle}>
+                    {item.actionLabel}
+                  </Link>
+                ) : (
+                  <a href={item.actionHref} className="insight-action" style={insightActionButtonStyle}>
+                    {item.actionLabel}
+                  </a>
+                )}
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="main-grid">
+          <section id="course-modules" className="panel">
+            <div className="panel-header">
+              <p className="eyebrow">Coursera-style Structure</p>
+              <h2>Course modules and readiness</h2>
+              <p>
+                Keep course overview visible: modules, resources, student count, and delivery readiness.
+              </p>
+            </div>
+
+            <div className="course-list">
+              {courseSnapshots.map((snapshot) => {
+                const isOpen = expandedCourseId === snapshot.course.id;
+                return (
+                  <article key={snapshot.course.id} className="course-card">
+                    <button
+                      type="button"
+                      className="course-toggle"
+                      onClick={() =>
+                        setExpandedCourseId((prev) => (prev === snapshot.course.id ? "" : snapshot.course.id))
+                      }
+                    >
+                      <div>
+                        <h3>{snapshot.course.title}</h3>
+                        <p>
+                          {snapshot.course.level} | {snapshot.course.duration} | {snapshot.moduleCount} modules
+                        </p>
+                      </div>
+                      <span className="expand-indicator">{isOpen ? "Hide" : "View"}</span>
+                    </button>
+
+                    <div className="course-stat-row">
+                      <span>{snapshot.paidEnrollmentCount} students</span>
+                      <span>{snapshot.materialsCount} resources</span>
+                      <span>{snapshot.assignmentsCount} assignments</span>
+                      <span>{snapshot.videosCount} videos</span>
+                      <span>Readiness {snapshot.readinessScore}%</span>
+                    </div>
+
+                    {isOpen && (
+                      <div className="course-detail">
+                        <p className="course-headline">{snapshot.course.headline}</p>
+                        <p className="course-description">{snapshot.course.description}</p>
+                        <p className="course-updated">Last updated: {snapshot.latestUpdate}</p>
+
+                        <div className="module-list">
+                          {snapshot.course.syllabus?.map((module) => (
+                            <div key={module.id} className="module-item">
+                              <div>
+                                <p className="module-week">{module.weekLabel}</p>
+                                <h4>{module.title}</h4>
+                              </div>
+                              <p className="module-duration">{module.duration}</p>
+                              <p className="module-formats">{(module.formats || []).join(" | ")}</p>
+                              <p className="module-task">Practice task: {module.practiceTask}</p>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div className="course-detail-actions">
+                          <button
+                            type="button"
+                            className="solid-btn"
+                            onClick={() => handleOpenUploadForCourse(snapshot.course.id)}
+                          >
+                            Upload resource for this course
+                          </button>
+                          <button
+                            type="button"
+                            className="outline-btn"
+                            onClick={() => router.push("/teacher/resources")}
+                          >
+                            Manage all resources
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
             </div>
           </section>
-          <section
-            id="upload"
-            style={{
-              borderRadius: "28px",
-              border: "1px solid rgba(203,213,225,0.6)",
-              backgroundColor: "white",
-              boxShadow: "0 25px 55px rgba(15,23,42,0.12)",
-              padding: "28px",
-              display: "grid",
-              gap: "18px",
-            }}
-          >
-            <div>
-              <p style={{ margin: 0, fontSize: "12px", letterSpacing: "0.12em", color: "#2563eb" }}>
-                RESOURCE UPLOAD
-              </p>
-              <h2 style={{ marginTop: "6px", fontSize: "22px", color: "#0f172a" }}>
-                Upload a new resource
-              </h2>
-              <p style={{ marginTop: "4px", fontSize: "13px", color: "#475569" }}>
-                Attach media, describe how students should use it, and publish when ready.
-              </p>
-            </div>
 
-            <form onSubmit={handleSubmit} style={{ display: "grid", gap: "16px" }}>
-              <label style={{ display: "grid", gap: "6px" }}>
-                <span style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                  Course
-                </span>
-                <select
-                  value={courseId}
-                  onChange={(event) => setCourseId(event.target.value)}
-                  style={{
-                    padding: "12px 14px",
-                    borderRadius: "14px",
-                    border: "1px solid rgba(148,163,184,0.6)",
-                    backgroundColor: "#f8fafc",
-                    color: "#0f172a",
-                    fontSize: "14px",
-                  }}
-                >
-                  {courseCatalog.map((course) => (
-                    <option key={course.id} value={course.id}>
-                      {course.title}
-                    </option>
-                  ))}
-                </select>
-              </label>
+          <div className="right-stack">
+            <section id="upload-section" className="panel">
+              <div className="panel-header">
+              
+                <h2>Upload a new resource</h2>
+                <p>Publish quickly, then decide visibility for students.</p>
+              </div>
 
-              <div
-                style={{
-                  display: "grid",
-                  gap: "16px",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
-                }}
-              >
-                <label style={{ display: "grid", gap: "6px" }}>
-                  <span style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                    Title
-                  </span>
-                  <input
-                    type="text"
-                    value={title}
-                    onChange={(event) => setTitle(event.target.value)}
-                    placeholder="Resource title"
-                    style={{
-                      padding: "12px 14px",
-                      borderRadius: "14px",
-                      border: "1px solid rgba(148,163,184,0.6)",
-                      backgroundColor: "#f8fafc",
-                      color: "#0f172a",
-                      fontSize: "14px",
-                    }}
-                  />
-                </label>
-
-                <label style={{ display: "grid", gap: "6px" }}>
-                  <span style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                    Type
-                  </span>
-                  <select
-                    value={type}
-                    onChange={(event) => setType(event.target.value)}
-                    style={{
-                      padding: "12px 14px",
-                      borderRadius: "14px",
-                      border: "1px solid rgba(148,163,184,0.6)",
-                      backgroundColor: "#f8fafc",
-                      color: "#0f172a",
-                      fontSize: "14px",
-                    }}
-                  >
-                    {RESOURCE_TYPES.map((item) => (
-                      <option key={item.value} value={item.value}>
-                        {item.label}
+              <form onSubmit={handleSubmit} className="form-grid">
+                <label className="field">
+                  <span>Course</span>
+                  <select value={courseId} onChange={(event) => setCourseId(event.target.value)}>
+                    {courseCatalog.map((course) => (
+                      <option key={course.id} value={course.id}>
+                        {course.title}
                       </option>
                     ))}
                   </select>
                 </label>
+
+                <div className="split-grid">
+                  <label className="field">
+                    <span>Title</span>
+                    <input
+                      type="text"
+                      value={title}
+                      onChange={(event) => setTitle(event.target.value)}
+                      placeholder="Resource title"
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>Type</span>
+                    <select value={type} onChange={(event) => setType(event.target.value)}>
+                      {RESOURCE_TYPES.map((item) => (
+                        <option key={item.value} value={item.value}>
+                          {item.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                <label className="field">
+                  <span>Description</span>
+                  <textarea
+                    value={description}
+                    onChange={(event) => setDescription(event.target.value)}
+                    rows={3}
+                    placeholder="Short notes for students"
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Link / file URL</span>
+                  <input
+                    type="url"
+                    value={url}
+                    onChange={(event) => setUrl(event.target.value)}
+                    placeholder="https://..."
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Upload file (optional)</span>
+                  <div className="file-row">
+                    <label htmlFor="fileUpload" className="file-btn">
+                      Choose file
+                    </label>
+                    <span className="file-name">{file ? file.name : "No file chosen"}</span>
+                    <input
+                      id="fileUpload"
+                      type="file"
+                      accept=".pdf,.png,.jpg,.jpeg,.mp3,.mp4"
+                      onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+                      hidden
+                    />
+                  </div>
+                </label>
+
+                <label className="checkbox-row">
+                  <input
+                    type="checkbox"
+                    checked={visibleToStudents}
+                    onChange={(event) => setVisibleToStudents(event.target.checked)}
+                  />
+                  <span>Visible to students</span>
+                </label>
+
+                <button type="submit" className="solid-btn" disabled={isUploading}>
+                  {isUploading ? "Uploading..." : "Save resource"}
+                </button>
+              </form>
+            </section>
+
+            <section id="meeting-links" className="panel">
+              <div className="panel-header">
+                <h2>Enrollment meeting links</h2>
+                <p>Search and update meeting links by student or course.</p>
               </div>
 
-              <label style={{ display: "grid", gap: "6px" }}>
-                <span style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                  Description
-                </span>
-                <textarea
-                  value={description}
-                  onChange={(event) => setDescription(event.target.value)}
-                  rows={3}
-                  placeholder="Short notes about how students should use this resource"
-                  style={{
-                    padding: "12px",
-                    borderRadius: "14px",
-                    border: "1px solid rgba(148,163,184,0.6)",
-                    backgroundColor: "#f8fafc",
-                    color: "#0f172a",
-                    fontSize: "14px",
-                    resize: "vertical",
-                  }}
-                />
-              </label>
-
-              <label style={{ display: "grid", gap: "6px" }}>
-                <span style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                  Link / file URL
-                </span>
-                <input
-                  type="url"
-                  value={url}
-                  onChange={(event) => setUrl(event.target.value)}
-                  placeholder="https://..."
-                  style={{
-                    padding: "12px 14px",
-                    borderRadius: "14px",
-                    border: "1px solid rgba(148,163,184,0.6)",
-                    backgroundColor: "#f8fafc",
-                    color: "#0f172a",
-                    fontSize: "14px",
-                  }}
-                />
-              </label>
-
-              <label style={{ display: "grid", gap: "6px" }}>
-                <span style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                  Upload file (optional)
-                </span>
-                <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
-                  <label
-                    htmlFor="fileUpload"
-                    style={{
-                      display: "inline-block",
-                      background: "linear-gradient(120deg, #2563eb, #1d4ed8)",
-                      color: "white",
-                      padding: "10px 16px",
-                      borderRadius: "10px",
-                      fontWeight: 600,
-                      cursor: "pointer",
-                    }}
+              <div className="meeting-toolbar">
+                <div className="filters">
+                  <select
+                    value={meetingCourseFilter}
+                    onChange={(event) => setMeetingCourseFilter(event.target.value)}
                   >
-                    Choose File
-                  </label>
-                  <span style={{ color: "#475569", fontSize: "14px" }}>
-                    {file ? file.name : "No file chosen"}
-                  </span>
+                    <option value="all">All courses</option>
+                    {courseCatalog.map((course) => (
+                      <option key={course.id} value={course.id}>
+                        {course.title}
+                      </option>
+                    ))}
+                  </select>
 
                   <input
-                    id="fileUpload"
-                    type="file"
-                    accept=".pdf,.png,.jpg,.jpeg,.mp3,.mp4"
-                    onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-                    style={{ display: "none" }}
+                    value={meetingSearch}
+                    onChange={(event) => setMeetingSearch(event.target.value)}
+                    placeholder="Search student or email"
                   />
                 </div>
 
-                <span style={{ fontSize: "12px", color: "#94a3b8" }}>
-                  Uploading will store the file in Firebase Storage and auto-fill the URL.
-                </span>
-              </label>
-
-              <label style={{ display: "inline-flex", gap: "8px", alignItems: "center" }}>
-                <input
-                  type="checkbox"
-                  checked={visibleToStudents}
-                  onChange={(event) => setVisibleToStudents(event.target.checked)}
-                />
-                <span style={{ fontSize: "13px", color: "#0f172a" }}>Visible to students</span>
-              </label>
-
-              <button
-                type="submit"
-                disabled={isUploading}
-                style={{
-                  padding: "14px 18px",
-                  borderRadius: "14px",
-                  border: "none",
-                  background: isUploading
-                    ? "linear-gradient(120deg, #94a3b8, #64748b)"
-                    : "linear-gradient(120deg, #2563eb, #1d4ed8)",
-                  color: "white",
-                  fontWeight: 600,
-                  cursor: isUploading ? "not-allowed" : "pointer",
-                  boxShadow: "0 18px 40px rgba(37,99,235,0.25)",
-                }}
-              >
-                {isUploading ? "Uploading..." : "Save resource"}
-              </button>
-            </form>
-          </section>
-
-          <section
-            style={{
-              borderRadius: "28px",
-              border: "1px solid rgba(203,213,225,0.6)",
-              backgroundColor: "white",
-              boxShadow: "0 25px 55px rgba(15,23,42,0.12)",
-              padding: "28px",
-              display: "grid",
-              gap: "18px",
-            }}
-          >
-            <div>
-              <p style={{ margin: 0, fontSize: "12px", letterSpacing: "0.12em", color: "#2563eb" }}>
-                CLASS LINKS
-              </p>
-              <h2 style={{ marginTop: "6px", fontSize: "22px", color: "#0f172a" }}>
-                Enrollment meeting links
-              </h2>
-              <p style={{ marginTop: "4px", fontSize: "13px", color: "#475569" }}>
-                Add the fixed online meeting link for each enrolled student.
-              </p>
-            </div>
-
-            {enrollments.length === 0 ? (
-              <p style={{ fontSize: "13px", color: "#475569" }}>
-                No enrollments found yet.
-              </p>
-            ) : (
-              <div style={{ display: "grid", gap: "14px" }}>
-                {enrollments.map((enrollment) => {
-                  const course = courseCatalog.find((item) => item.id === enrollment.courseId);
-                  const dayLabel = (enrollment.timeSlotDay || "").trim();
-                  const startTime = (enrollment.timeSlotStartTime || "").trim();
-                  const endTime = (enrollment.timeSlotEndTime || "").trim();
-                  const slotLabel =
-                    dayLabel && startTime && endTime
-                      ? `${dayLabel} ${startTime} - ${endTime}`
-                      : enrollment.timeSlotLabel || "Schedule pending";
-                  const meetingValue =
-                    meetingDrafts[enrollment.docId] ?? enrollment.meetingLink ?? "";
-                  const isSaving = savingMeetingId === enrollment.docId;
-
-                  return (
-                    <div
-                      key={enrollment.docId}
-                      style={{
-                        borderRadius: "18px",
-                        border: "1px solid rgba(226,232,240,0.8)",
-                        padding: "18px",
-                        backgroundColor: "#f8fafc",
-                        display: "grid",
-                        gap: "12px",
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          flexWrap: "wrap",
-                          gap: "12px",
-                          alignItems: "center",
-                        }}
-                      >
-                        <div>
-                          <p style={{ margin: 0, fontSize: "14px", fontWeight: 600, color: "#0f172a" }}>
-                            {course?.title || enrollment.courseTitle || "Course"}
-                          </p>
-                          <p style={{ margin: "6px 0 0", fontSize: "12px", color: "#475569" }}>
-                            {enrollment.studentName || enrollment.studentEmail || "Student"}
-                          </p>
-                          <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#94a3b8" }}>
-                            Weekly slot: {slotLabel}
-                          </p>
-                        </div>
-                        <span
-                          style={{
-                            padding: "4px 12px",
-                            borderRadius: "999px",
-                            fontSize: "12px",
-                            fontWeight: 600,
-                            backgroundColor: "rgba(59,130,246,0.12)",
-                            color: "#1d4ed8",
-                          }}
-                        >
-                          {enrollment.paymentStatus === "paid" || enrollment.status === "Paid" ? "Paid" : "Pending"}
-                        </span>
-                      </div>
-
-                      <div style={{ display: "grid", gap: "10px" }}>
-                        <input
-                          type="url"
-                          value={meetingValue}
-                          onChange={(event) =>
-                            setMeetingDrafts((prev) => ({
-                              ...prev,
-                              [enrollment.docId]: event.target.value,
-                            }))
-                          }
-                          placeholder="https://meet.google.com/..."
-                          style={{
-                            padding: "12px 14px",
-                            borderRadius: "12px",
-                            border: "1px solid rgba(148,163,184,0.6)",
-                            backgroundColor: "white",
-                            color: "#0f172a",
-                            fontSize: "14px",
-                          }}
-                        />
-                        <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-                          <button
-                            type="button"
-                            onClick={() => handleSaveMeetingLink(enrollment)}
-                            disabled={isSaving}
-                            style={{
-                              padding: "10px 16px",
-                              borderRadius: "12px",
-                              border: "none",
-                              background: isSaving
-                                ? "linear-gradient(120deg, #94a3b8, #64748b)"
-                                : "linear-gradient(120deg, #2563eb, #1d4ed8)",
-                              color: "white",
-                              fontWeight: 600,
-                              cursor: isSaving ? "not-allowed" : "pointer",
-                              boxShadow: "0 12px 24px rgba(37,99,235,0.22)",
-                            }}
-                          >
-                            {isSaving ? "Saving..." : "Save link"}
-                          </button>
-                          {enrollment.meetingLink ? (
-                            <a
-                              href={enrollment.meetingLink}
-                              target="_blank"
-                              rel="noreferrer"
-                              style={{
-                                display: "inline-flex",
-                                alignItems: "center",
-                                padding: "10px 16px",
-                                borderRadius: "12px",
-                                border: "1px solid rgba(37,99,235,0.4)",
-                                backgroundColor: "rgba(37,99,235,0.08)",
-                                color: "#1d4ed8",
-                                textDecoration: "none",
-                                fontWeight: 600,
-                              }}
-                            >
-                              Open link
-                            </a>
-                          ) : (
-                            <span style={{ fontSize: "12px", color: "#94a3b8" }}>
-                              No link saved yet.
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
+                <div className="meeting-status-toggle">
+                  <button
+                    type="button"
+                    className={meetingStatusFilter === "pending" ? "status-filter-btn active" : "status-filter-btn"}
+                    onClick={() => setMeetingStatusFilter("pending")}
+                  >
+                    Pending only ({pendingMeetingCountInScope})
+                  </button>
+                  <button
+                    type="button"
+                    className={meetingStatusFilter === "all" ? "status-filter-btn active" : "status-filter-btn"}
+                    onClick={() => setMeetingStatusFilter("all")}
+                  >
+                    All ({scopedMeetingEnrollments.length})
+                  </button>
+                </div>
               </div>
-            )}
-          </section>
-        </div>
+
+              {filteredEnrollments.length === 0 ? (
+                <p className="empty-state">No enrollments match the current filter.</p>
+              ) : (
+                <div className="meeting-groups-scroll">
+                  {groupedMeetingEnrollments.map((group) => {
+                    const isExpanded = expandedMeetingGroups[group.key] ?? false;
+                    return (
+                      <section key={group.key} className="meeting-group">
+                        <button
+                          type="button"
+                          className="meeting-group-toggle"
+                          onClick={() => toggleMeetingGroup(group.key)}
+                        >
+                          <div className="meeting-group-meta">
+                            <p className="meeting-group-title">{group.courseTitle}</p>
+                            <p className="meeting-group-sub">
+                              {group.items.length} students · {group.pendingCount} missing links
+                            </p>
+                          </div>
+                          <span className="meeting-group-arrow">{isExpanded ? "Hide ▾" : "Show ▸"}</span>
+                        </button>
+
+                        {isExpanded && (
+                          <div className="enrollment-list">
+                            {group.items.map((enrollment) => {
+                              const course = courseCatalog.find((item) => item.id === enrollment.courseId);
+                              const meetingValue = meetingDrafts[enrollment.docId] ?? enrollment.meetingLink ?? "";
+                              const isSaving = savingMeetingId === enrollment.docId;
+
+                              return (
+                                <article key={enrollment.docId} className="enrollment-card">
+                                  <div className="enrollment-head">
+                                    <div>
+                                      <p className="course-name">{course?.title || enrollment.courseTitle || "Course"}</p>
+                                      <p className="student-name">
+                                        {enrollment.studentName || enrollment.studentEmail || "Student"}
+                                      </p>
+                                      <p className="slot-label">Weekly slot: {getSlotLabel(enrollment)}</p>
+                                    </div>
+                                    <span className={hasPaidAccess(enrollment) ? "status-chip paid" : "status-chip pending"}>
+                                      {hasPaidAccess(enrollment) ? "Paid" : "Pending"}
+                                    </span>
+                                  </div>
+
+                                  <input
+                                    type="url"
+                                    value={meetingValue}
+                                    onChange={(event) =>
+                                      setMeetingDrafts((prev) => ({
+                                        ...prev,
+                                        [enrollment.docId]: event.target.value,
+                                      }))
+                                    }
+                                    placeholder="https://meet.google.com/..."
+                                  />
+
+                                  <div className="enrollment-actions">
+                                    <button
+                                      type="button"
+                                      className="solid-btn"
+                                      onClick={() => handleSaveMeetingLink(enrollment)}
+                                      disabled={isSaving}
+                                    >
+                                      {isSaving ? "Saving..." : "Save link"}
+                                    </button>
+                                    {enrollment.meetingLink ? (
+                                      <a href={enrollment.meetingLink} target="_blank" rel="noreferrer" className="outline-btn">
+                                        Open link
+                                      </a>
+                                    ) : (
+                                      <span className="hint">No link saved yet.</span>
+                                    )}
+                                  </div>
+                                </article>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </section>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          </div>
+        </section>
       </div>
+
+      <style jsx>{`
+        .teacher-dashboard {
+          min-height: 100vh;
+          background: radial-gradient(circle at 0% 0%, #fef9c3 0%, #f8fafc 48%),
+            linear-gradient(160deg, #f1f5f9 0%, #e2e8f0 100%);
+          padding: 28px 18px 48px;
+          font-family: var(--font-geist-sans), "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+          color: #0f172a;
+        }
+
+        .shell {
+          width: min(1260px, 100%);
+          margin: 0 auto;
+          display: grid;
+          gap: 18px;
+        }
+
+        .hero-card {
+          border-radius: 24px;
+          padding: 22px;
+          background: linear-gradient(130deg, #0f172a 0%, #1d4ed8 58%, #0ea5e9 100%);
+          color: #f8fafc;
+          box-shadow: 0 20px 44px rgba(15, 23, 42, 0.25);
+          display: grid;
+          gap: 16px;
+        }
+
+        .hero-top {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-start;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+
+        .teacher-chip {
+          display: flex;
+          gap: 14px;
+          align-items: center;
+        }
+
+        .avatar {
+          width: 52px;
+          height: 52px;
+          border-radius: 14px;
+          background: rgba(248, 250, 252, 0.18);
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          font-weight: 700;
+          font-size: 22px;
+          border: 1px solid rgba(248, 250, 252, 0.35);
+        }
+
+        .eyebrow {
+          margin: 0;
+          font-size: 11px;
+          letter-spacing: 0.14em;
+          text-transform: uppercase;
+          color: rgba(226, 232, 240, 0.9);
+        }
+
+        .hero-card h1 {
+          margin: 4px 0;
+          font-size: 28px;
+          line-height: 1.2;
+        }
+
+        .hero-subtitle {
+          margin: 0;
+          color: rgba(226, 232, 240, 0.88);
+          max-width: 720px;
+          font-size: 14px;
+        }
+
+        .hero-actions {
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+
+        .primary-cta,
+        .ghost-cta,
+        .solid-btn,
+        .outline-btn,
+        .danger-btn,
+        .file-btn {
+          border: none;
+          border-radius: 12px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          text-decoration: none;
+          display: inline-flex;
+          justify-content: center;
+          align-items: center;
+          transition: all 0.18s ease;
+        }
+
+        .primary-cta {
+          padding: 10px 16px;
+          background: #f8fafc;
+          color: #0f172a;
+          border: 1px solid rgba(226, 232, 240, 0.85);
+          box-shadow: 0 10px 22px rgba(15, 23, 42, 0.18);
+        }
+
+        .ghost-cta {
+          padding: 10px 14px;
+          background: #ffffff;
+          color: #0f172a;
+          border: 1px solid rgba(226, 232, 240, 0.88);
+          box-shadow: 0 10px 22px rgba(15, 23, 42, 0.18);
+        }
+
+        .primary-cta:hover,
+        .ghost-cta:hover {
+          transform: translateY(-1px);
+          box-shadow: 0 14px 28px rgba(15, 23, 42, 0.22);
+        }
+
+        .danger-btn {
+          padding: 10px 14px;
+          background: rgba(248, 113, 113, 0.24);
+          color: #fff;
+          border: 1px solid rgba(252, 165, 165, 0.35);
+        }
+
+        .metric-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+          gap: 10px;
+        }
+
+        .main-grid {
+          display: grid;
+          gap: 14px;
+          grid-template-columns: minmax(0, 1.3fr) minmax(340px, 1fr);
+          align-items: start;
+        }
+
+        .insight-panel {
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          border-radius: 20px;
+          padding: 18px;
+          box-shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
+          display: grid;
+          gap: 12px;
+        }
+
+        .insight-grid {
+          display: grid;
+          gap: 10px;
+          grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        }
+
+        .insight-card {
+          border: 1px solid #e2e8f0;
+          border-radius: 14px;
+          padding: 12px;
+          background: #f8fafc;
+          display: grid;
+          gap: 5px;
+        }
+
+        .insight-label {
+          margin: 0;
+          font-size: 11px;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          color: #0284c7;
+          font-weight: 700;
+        }
+
+        .insight-value {
+          font-size: 18px;
+          line-height: 1.25;
+          color: #0f172a;
+        }
+
+        .insight-note {
+          margin: 0;
+          font-size: 12px;
+          color: #475569;
+          line-height: 1.4;
+          min-height: 34px;
+        }
+
+        .insight-action {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          padding: 8px 12px;
+          border-radius: 10px;
+          border: 1px solid rgba(37, 99, 235, 0.32);
+          background: linear-gradient(120deg, #2563eb, #1d4ed8);
+          box-shadow: 0 10px 20px rgba(37, 99, 235, 0.22);
+          font-size: 12px;
+          font-weight: 700;
+          color: #ffffff;
+          text-decoration: none;
+          width: fit-content;
+          transition: all 0.18s ease;
+        }
+
+        .insight-action:hover {
+          transform: translateY(-1px);
+          box-shadow: 0 14px 24px rgba(37, 99, 235, 0.26);
+        }
+
+        .insight-action:active {
+          transform: translateY(0);
+        }
+
+        .panel {
+          background: #ffffff;
+          border: 1px solid #e2e8f0;
+          border-radius: 20px;
+          padding: 18px;
+          box-shadow: 0 18px 36px rgba(15, 23, 42, 0.08);
+          display: grid;
+          gap: 14px;
+        }
+
+        .panel-header h2 {
+          margin: 6px 0 4px;
+          font-size: 22px;
+        }
+
+        .panel-header p {
+          margin: 0;
+          color: #475569;
+          font-size: 13px;
+          line-height: 1.45;
+        }
+
+        .course-list {
+          display: grid;
+          gap: 12px;
+        }
+
+        .course-card {
+          border: 1px solid #e2e8f0;
+          border-radius: 16px;
+          padding: 12px;
+          background: #f8fafc;
+          display: grid;
+          gap: 10px;
+        }
+
+        .course-toggle {
+          border: none;
+          background: transparent;
+          padding: 0;
+          text-align: left;
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+          cursor: pointer;
+          color: inherit;
+        }
+
+        .course-toggle h3 {
+          margin: 0;
+          font-size: 18px;
+        }
+
+        .course-toggle p {
+          margin: 4px 0 0;
+          font-size: 12px;
+          color: #64748b;
+        }
+
+        .expand-indicator {
+          align-self: center;
+          font-size: 12px;
+          font-weight: 600;
+          color: #0ea5e9;
+          border: 1px solid #bae6fd;
+          padding: 6px 10px;
+          border-radius: 999px;
+          background: #f0f9ff;
+        }
+
+        .course-stat-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .course-stat-row span {
+          font-size: 12px;
+          color: #334155;
+          border: 1px solid #e2e8f0;
+          background: #fff;
+          border-radius: 999px;
+          padding: 5px 10px;
+        }
+
+        .course-detail {
+          border-top: 1px solid #e2e8f0;
+          padding-top: 10px;
+          display: grid;
+          gap: 10px;
+        }
+
+        .course-headline {
+          margin: 0;
+          color: #0f172a;
+          font-weight: 600;
+          font-size: 13px;
+        }
+
+        .course-description,
+        .course-updated {
+          margin: 0;
+          color: #475569;
+          font-size: 13px;
+          line-height: 1.45;
+        }
+
+        .module-list {
+          display: grid;
+          gap: 8px;
+        }
+
+        .module-item {
+          border: 1px solid #e2e8f0;
+          border-radius: 14px;
+          padding: 10px;
+          background: #fff;
+          display: grid;
+          gap: 4px;
+        }
+
+        .module-week {
+          margin: 0;
+          font-size: 11px;
+          text-transform: uppercase;
+          color: #0284c7;
+          letter-spacing: 0.08em;
+          font-weight: 700;
+        }
+
+        .module-item h4 {
+          margin: 0;
+          font-size: 14px;
+          color: #0f172a;
+        }
+
+        .module-duration,
+        .module-formats,
+        .module-task {
+          margin: 0;
+          font-size: 12px;
+          color: #475569;
+          line-height: 1.4;
+        }
+
+        .course-detail-actions,
+        .enrollment-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .solid-btn {
+          padding: 10px 14px;
+          background: linear-gradient(120deg, #2563eb, #1d4ed8);
+          color: #fff;
+        }
+
+        .solid-btn:disabled {
+          background: #94a3b8;
+          cursor: not-allowed;
+        }
+
+        .outline-btn {
+          padding: 9px 14px;
+          border: 1px solid #93c5fd;
+          background: #eff6ff;
+          color: #1d4ed8;
+        }
+
+        .right-stack {
+          display: grid;
+          gap: 14px;
+        }
+
+        .form-grid,
+        .field {
+          display: grid;
+          gap: 6px;
+        }
+
+        .split-grid {
+          display: grid;
+          gap: 10px;
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        }
+
+        .field span {
+          font-size: 12px;
+          color: #0f172a;
+          font-weight: 600;
+        }
+
+        .field input,
+        .field select,
+        .field textarea,
+        .filters input,
+        .filters select,
+        .enrollment-card input {
+          width: 100%;
+          border: 1px solid #cbd5e1;
+          background: #fff;
+          color: #0f172a;
+          border-radius: 12px;
+          padding: 10px 12px;
+          font-size: 13px;
+        }
+
+        .checkbox-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 13px;
+          color: #334155;
+        }
+
+        .file-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
+        .file-btn {
+          background: #0f172a;
+          color: #fff;
+          padding: 8px 12px;
+        }
+
+        .file-name,
+        .hint,
+        .empty-state {
+          font-size: 12px;
+          color: #64748b;
+        }
+
+        .filters {
+          display: grid;
+          gap: 8px;
+          grid-template-columns: minmax(140px, 190px) minmax(0, 1fr);
+        }
+
+        .meeting-toolbar {
+          display: grid;
+          gap: 10px;
+        }
+
+        .meeting-status-toggle {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .status-filter-btn {
+          border: 1px solid #cbd5e1;
+          border-radius: 10px;
+          background: #ffffff;
+          color: #334155;
+          font-size: 12px;
+          font-weight: 600;
+          padding: 7px 10px;
+          cursor: pointer;
+        }
+
+        .status-filter-btn.active {
+          border-color: rgba(37, 99, 235, 0.45);
+          background: rgba(37, 99, 235, 0.12);
+          color: #1d4ed8;
+        }
+
+        .meeting-groups-scroll {
+          display: grid;
+          gap: 10px;
+          max-height: 720px;
+          overflow: auto;
+          padding-right: 4px;
+        }
+
+        .meeting-group {
+          border: 1px solid #e2e8f0;
+          border-radius: 14px;
+          background: #ffffff;
+          padding: 10px;
+          display: grid;
+          gap: 10px;
+        }
+
+        .meeting-group-toggle {
+          border: 1px solid #e2e8f0;
+          background: #f8fafc;
+          border-radius: 12px;
+          padding: 10px;
+          text-align: left;
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          gap: 10px;
+          cursor: pointer;
+        }
+
+        .meeting-group-meta {
+          display: grid;
+          gap: 2px;
+        }
+
+        .meeting-group-title {
+          margin: 0;
+          font-size: 13px;
+          font-weight: 700;
+          color: #0f172a;
+          line-height: 1.35;
+        }
+
+        .meeting-group-sub {
+          margin: 0;
+          font-size: 12px;
+          color: #64748b;
+          line-height: 1.35;
+        }
+
+        .meeting-group-arrow {
+          font-size: 12px;
+          color: #1d4ed8;
+          font-weight: 700;
+          white-space: nowrap;
+        }
+
+        .enrollment-list {
+          display: grid;
+          gap: 10px;
+        }
+
+        .enrollment-card {
+          border: 1px solid #e2e8f0;
+          border-radius: 14px;
+          padding: 12px;
+          background: #f8fafc;
+          display: grid;
+          gap: 8px;
+        }
+
+        .enrollment-head {
+          display: flex;
+          justify-content: space-between;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+
+        .course-name,
+        .student-name,
+        .slot-label {
+          margin: 0;
+          line-height: 1.35;
+        }
+
+        .course-name {
+          font-size: 13px;
+          font-weight: 700;
+          color: #0f172a;
+        }
+
+        .student-name,
+        .slot-label {
+          font-size: 12px;
+          color: #475569;
+        }
+
+        .status-chip {
+          border-radius: 999px;
+          padding: 4px 10px;
+          font-size: 11px;
+          font-weight: 700;
+          align-self: flex-start;
+        }
+
+        .status-chip.paid {
+          color: #0369a1;
+          background: #e0f2fe;
+          border: 1px solid #bae6fd;
+        }
+
+        .status-chip.pending {
+          color: #92400e;
+          background: #fef3c7;
+          border: 1px solid #fde68a;
+        }
+
+        @media (max-width: 1080px) {
+          .main-grid {
+            grid-template-columns: 1fr;
+          }
+
+          .meeting-groups-scroll {
+            max-height: none;
+          }
+        }
+
+        @media (max-width: 760px) {
+          .teacher-dashboard {
+            padding: 20px 12px 36px;
+          }
+
+          .hero-card,
+          .panel {
+            border-radius: 16px;
+            padding: 14px;
+          }
+
+          .hero-card h1 {
+            font-size: 23px;
+          }
+
+          .filters {
+            grid-template-columns: 1fr;
+          }
+        }
+      `}</style>
     </main>
   );
 }
 
-function SummaryCard({ label, value, accent = true }) {
-  const palette = accent
-    ? { background: "rgba(255,255,255,0.12)", color: "#f8fafc" }
-    : { background: "rgba(15,23,42,0.25)", color: "#cbd5f5" };
+function MetricCard({ label, value, tone = "default" }) {
   return (
-    <div
-      style={{
-        borderRadius: "16px",
-        padding: "14px 16px",
-        backgroundColor: palette.background,
-        backdropFilter: "blur(4px)",
-        border: "1px solid rgba(255,255,255,0.18)",
-        display: "grid",
-        gap: "6px",
-      }}
-    >
-      <span
-        style={{
-          fontSize: "12px",
-          textTransform: "uppercase",
-          letterSpacing: "0.08em",
-          color: "rgba(248,250,252,0.72)",
-        }}
-      >
-        {label}
-      </span>
-      <strong style={{ fontSize: "20px", fontWeight: 700, color: palette.color }}>{value}</strong>
+    <div className={`metric-card ${tone}`}>
+      <p>{label}</p>
+      <strong>{value}</strong>
+      <style jsx>{`
+        .metric-card {
+          border-radius: 14px;
+          padding: 12px;
+          border: 1px solid rgba(226, 232, 240, 0.3);
+          background: rgba(248, 250, 252, 0.12);
+          display: grid;
+          gap: 4px;
+        }
+
+        .metric-card p {
+          margin: 0;
+          font-size: 11px;
+          text-transform: uppercase;
+          letter-spacing: 0.08em;
+          color: rgba(226, 232, 240, 0.82);
+        }
+
+        .metric-card strong {
+          font-size: 22px;
+          line-height: 1.1;
+          color: #f8fafc;
+        }
+
+        .metric-card.warning {
+          background: rgba(250, 204, 21, 0.18);
+          border-color: rgba(253, 224, 71, 0.52);
+        }
+      `}</style>
     </div>
   );
 }

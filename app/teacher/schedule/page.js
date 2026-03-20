@@ -105,6 +105,38 @@ function formatSessionDateTime(session) {
   return parsed.toLocaleString();
 }
 
+function getSessionTimestamp(session) {
+  if (!session?.date) return null;
+  const parsed = new Date(`${session.date}T${session.startTime || "00:00"}`);
+  const stamp = parsed.getTime();
+  return Number.isNaN(stamp) ? null : stamp;
+}
+
+function parseDateTimeMs(dateValue, timeValue = "00:00") {
+  if (!dateValue || typeof dateValue !== "string") return null;
+  const time = String(timeValue || "00:00").slice(0, 5);
+  const normalizedTime = /^\d{2}:\d{2}$/.test(time) ? time : "00:00";
+  const parsed = new Date(`${dateValue}T${normalizedTime}`);
+  const stamp = parsed.getTime();
+  return Number.isNaN(stamp) ? null : stamp;
+}
+
+function getRequestDeadlineMs(request) {
+  return (
+    parseDateTimeMs(request?.requestedDate, request?.requestedTime) ??
+    parseDateTimeMs(request?.sessionDate, request?.sessionStartTime)
+  );
+}
+
+function getRequestQueueKey(deadlineMs, nowMs = Date.now()) {
+  const dayMs = 24 * 60 * 60 * 1000;
+  if (deadlineMs === null) return "later";
+  if (deadlineMs < nowMs) return "overdue";
+  if (deadlineMs < nowMs + 2 * dayMs) return "urgent";
+  if (deadlineMs < nowMs + 7 * dayMs) return "thisWeek";
+  return "later";
+}
+
 export default function TeacherSchedulePage() {
 
   const router = useRouter();
@@ -125,6 +157,16 @@ export default function TeacherSchedulePage() {
   const [processingRequestId, setProcessingRequestId] = useState(null);
   const [requestFilter, setRequestFilter] = useState("pending");
   const [creatingFixedSessionKey, setCreatingFixedSessionKey] = useState(null);
+  const [activeScheduleTab, setActiveScheduleTab] = useState("calendar");
+  const [sessionCourseFilter, setSessionCourseFilter] = useState("all");
+  const [sessionRangeFilter, setSessionRangeFilter] = useState("all");
+  const [sessionSearchKeyword, setSessionSearchKeyword] = useState("");
+  const [expandedFixedCourseIds, setExpandedFixedCourseIds] = useState({});
+  const [expandedUpcomingGroups, setExpandedUpcomingGroups] = useState({
+    today: true,
+    thisWeek: true,
+    later: true,
+  });
 
   useEffect(() => {
     if (loading) return;
@@ -296,6 +338,7 @@ export default function TeacherSchedulePage() {
           resolvedBy: sessionUser.email ?? "instructor",
         });
       }
+      
 //把老师刚输入的资料删掉 在前端
       setResolutionDrafts((prev) => {
         const next = { ...prev };
@@ -391,6 +434,106 @@ export default function TeacherSchedulePage() {
     return { upcoming, past };
   }, [sessions]);
 
+  const sessionCourseOptions = useMemo(() => {
+    const grouped = new Map();
+    for (const session of sessions || []) {
+      if (session?.archived) continue;
+      if (!session?.courseId) continue;
+      if (grouped.has(session.courseId)) continue;
+      const catalogCourse = courseCatalog.find((course) => course.id === session.courseId);
+      grouped.set(session.courseId, catalogCourse?.title || session.courseTitle || session.courseId);
+    }
+
+    return Array.from(grouped.entries())
+      .map(([id, title]) => ({ id, title }))
+      .sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+  }, [sessions]);
+
+  const filteredUpcomingSessions = useMemo(() => {
+    const keyword = sessionSearchKeyword.trim().toLowerCase();
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todayStamp = startOfToday.getTime();
+    const inSevenDays = todayStamp + 7 * 24 * 60 * 60 * 1000;
+
+    return sessionsByDate.upcoming.filter((session) => {
+      if (sessionCourseFilter !== "all" && (session.courseId || "") !== sessionCourseFilter) return false;
+
+      const stamp = getSessionTimestamp(session);
+      if (sessionRangeFilter === "today") {
+        if (stamp === null || stamp < todayStamp || stamp >= todayStamp + 24 * 60 * 60 * 1000) return false;
+      } else if (sessionRangeFilter === "next7") {
+        if (stamp === null || stamp < todayStamp || stamp >= inSevenDays) return false;
+      }
+
+      if (!keyword) return true;
+      const searchable = [
+        session.title,
+        session.courseTitle,
+        session.location,
+        session.date,
+        session.startTime,
+      ]
+        .join(" ")
+        .toLowerCase();
+      return searchable.includes(keyword);
+    });
+  }, [sessionsByDate.upcoming, sessionCourseFilter, sessionRangeFilter, sessionSearchKeyword]);
+
+  const filteredPastSessions = useMemo(() => {
+    const keyword = sessionSearchKeyword.trim().toLowerCase();
+    return sessionsByDate.past.filter((session) => {
+      if (sessionCourseFilter !== "all" && (session.courseId || "") !== sessionCourseFilter) return false;
+      if (!keyword) return true;
+      const searchable = [
+        session.title,
+        session.courseTitle,
+        session.location,
+        session.date,
+        session.startTime,
+      ]
+        .join(" ")
+        .toLowerCase();
+      return searchable.includes(keyword);
+    });
+  }, [sessionsByDate.past, sessionCourseFilter, sessionSearchKeyword]);
+
+  const upcomingSessionGroups = useMemo(() => {
+    const oneDay = 24 * 60 * 60 * 1000;
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+    const todayStart = startOfToday.getTime();
+    const tomorrowStart = todayStart + oneDay;
+    const nextWeekStart = todayStart + 7 * oneDay;
+
+    const grouped = {
+      today: [],
+      thisWeek: [],
+      later: [],
+    };
+
+    for (const session of filteredUpcomingSessions) {
+      const stamp = getSessionTimestamp(session);
+      if (stamp === null) {
+        grouped.later.push(session);
+        continue;
+      }
+      if (stamp < tomorrowStart) {
+        grouped.today.push(session);
+      } else if (stamp < nextWeekStart) {
+        grouped.thisWeek.push(session);
+      } else {
+        grouped.later.push(session);
+      }
+    }
+
+    return [
+      { key: "today", label: "Today", sessions: grouped.today },
+      { key: "thisWeek", label: "This week", sessions: grouped.thisWeek },
+      { key: "later", label: "Later", sessions: grouped.later },
+    ];
+  }, [filteredUpcomingSessions]);
+
   const attendanceMap = useMemo(() => {
     const map = new Map();
     for (const record of attendanceRecords) {
@@ -416,6 +559,85 @@ export default function TeacherSchedulePage() {
     if (requestFilter === "all") return rescheduleRequests;
     return pendingRequests;
   }, [requestFilter, pendingRequests, resolvedRequests, rescheduleRequests]);
+
+  const requestQueueMeta = useMemo(
+    () => ({
+      overdue: {
+        key: "overdue",
+        label: "Overdue",
+        badgeColor: "#b91c1c",
+        badgeBg: "#fee2e2",
+        cardBg: "#fff1f2",
+        cardBorder: "rgba(244,63,94,0.35)",
+      },
+      urgent: {
+        key: "urgent",
+        label: "Urgent",
+        badgeColor: "#c2410c",
+        badgeBg: "#ffedd5",
+        cardBg: "#fff7ed",
+        cardBorder: "rgba(249,115,22,0.35)",
+      },
+      thisWeek: {
+        key: "thisWeek",
+        label: "This week",
+        badgeColor: "#1d4ed8",
+        badgeBg: "#dbeafe",
+        cardBg: "#eff6ff",
+        cardBorder: "rgba(59,130,246,0.35)",
+      },
+      later: {
+        key: "later",
+        label: "Later",
+        badgeColor: "#334155",
+        badgeBg: "#e2e8f0",
+        cardBg: "#f8fafc",
+        cardBorder: "rgba(148,163,184,0.35)",
+      },
+    }),
+    []
+  );
+
+  const pendingQueueCounts = useMemo(() => {
+    const nowMs = Date.now();
+    const counts = { overdue: 0, urgent: 0, thisWeek: 0, later: 0 };
+    for (const request of pendingRequests) {
+      const key = getRequestQueueKey(getRequestDeadlineMs(request), nowMs);
+      counts[key] += 1;
+    }
+    return counts;
+  }, [pendingRequests]);
+
+  const filteredPendingRequestGroups = useMemo(() => {
+    const nowMs = Date.now();
+    const grouped = { overdue: [], urgent: [], thisWeek: [], later: [] };
+    for (const request of filteredRequests) {
+      if (request.status !== "pending") continue;
+      const deadlineMs = getRequestDeadlineMs(request);
+      const queueKey = getRequestQueueKey(deadlineMs, nowMs);
+      grouped[queueKey].push({ ...request, deadlineMs, queueKey });
+    }
+
+    return Object.keys(grouped).map((key) => {
+      const items = grouped[key].sort((a, b) => {
+        const aDeadline = a.deadlineMs ?? Number.MAX_SAFE_INTEGER;
+        const bDeadline = b.deadlineMs ?? Number.MAX_SAFE_INTEGER;
+        if (aDeadline !== bDeadline) return aDeadline - bDeadline;
+        const aCreated = Date.parse(a.createdAt || "") || 0;
+        const bCreated = Date.parse(b.createdAt || "") || 0;
+        return aCreated - bCreated;
+      });
+      return {
+        ...requestQueueMeta[key],
+        items,
+      };
+    });
+  }, [filteredRequests, requestQueueMeta]);
+
+  const filteredResolvedRequests = useMemo(
+    () => filteredRequests.filter((request) => request.status !== "pending"),
+    [filteredRequests]
+  );
 
   const paidEnrollments = useMemo(
     () => (enrollments || []).filter((enrollment) => hasPaidAccess(enrollment)),
@@ -523,6 +745,102 @@ export default function TeacherSchedulePage() {
     return cleaned;
   }, [sessions]);
 
+  const fixedWeeklyCourseGroups = useMemo(() => {
+    const groups = new Map();
+
+    for (const slot of fixedWeeklySlots) {
+      const nextOccurrence = getNextSlotOccurrence(slot.dayLabel, slot.startTime);
+      const scheduledSession = nearestUpcomingSessionByCourse.get(slot.courseId) || null;
+      const matchingSession = nextOccurrence
+        ? sessions.find((session) => {
+            if (session.archived) return false;
+            if ((session.courseId || "") !== slot.courseId) return false;
+            if ((session.date || "") !== nextOccurrence.dateKey) return false;
+            if (!slot.startTime) return true;
+            return (session.startTime || "") === slot.startTime;
+          })
+        : null;
+      const usingScheduledSession =
+        !!scheduledSession && (!matchingSession || scheduledSession.id !== matchingSession.id);
+      const nextStamp =
+        nextOccurrence?.dateTime?.getTime() ??
+        getSessionTimestamp(scheduledSession) ??
+        Number.MAX_SAFE_INTEGER;
+      const nextLabel = nextOccurrence
+        ? nextOccurrence.dateTime.toLocaleString()
+        : scheduledSession
+        ? formatSessionDateTime(scheduledSession)
+        : "Date TBD";
+
+      const slotItem = {
+        ...slot,
+        nextOccurrence,
+        scheduledSession,
+        matchingSession,
+        usingScheduledSession,
+        nextStamp,
+        nextLabel,
+      };
+
+      if (!groups.has(slot.courseId)) {
+        groups.set(slot.courseId, {
+          courseId: slot.courseId,
+          courseTitle: slot.courseTitle,
+          slots: [],
+          studentMap: new Map(),
+        });
+      }
+
+      const group = groups.get(slot.courseId);
+      group.slots.push(slotItem);
+      for (const student of slot.students || []) {
+        const key = student.studentUid || student.studentEmail || student.studentName || "";
+        if (!key) continue;
+        if (!group.studentMap.has(key)) group.studentMap.set(key, student);
+      }
+    }
+
+    return Array.from(groups.values())
+      .map((group) => {
+        const slots = [...group.slots].sort((a, b) => {
+          if (a.nextStamp !== b.nextStamp) return a.nextStamp - b.nextStamp;
+          return (a.slotLabel || "").localeCompare(b.slotLabel || "");
+        });
+        const earliestStamp = slots[0]?.nextStamp ?? Number.MAX_SAFE_INTEGER;
+        return {
+          courseId: group.courseId,
+          courseTitle: group.courseTitle,
+          slots,
+          studentCount: group.studentMap.size,
+          students: Array.from(group.studentMap.values()).sort((a, b) =>
+            (a.studentName || "").localeCompare(b.studentName || "")
+          ),
+          earliestStamp,
+        };
+      })
+      .sort((a, b) => {
+        if (a.earliestStamp !== b.earliestStamp) return a.earliestStamp - b.earliestStamp;
+        return (a.courseTitle || "").localeCompare(b.courseTitle || "");
+      });
+  }, [fixedWeeklySlots, nearestUpcomingSessionByCourse, sessions]);
+
+  useEffect(() => {
+    if (!fixedWeeklyCourseGroups.length) {
+      setExpandedFixedCourseIds({});
+      return;
+    }
+
+    setExpandedFixedCourseIds((previous) => {
+      const next = {};
+      fixedWeeklyCourseGroups.forEach((group, index) => {
+        next[group.courseId] = Object.prototype.hasOwnProperty.call(previous, group.courseId)
+          ? previous[group.courseId]
+          : index === 0;
+      });
+      return next;
+    });
+  }, [fixedWeeklyCourseGroups]);
+
 //当前选中的课程
   const selectedSession = useMemo(
     () => sessions.find((session) => session.id === selectedSessionId) ?? null,
@@ -608,6 +926,273 @@ export default function TeacherSchedulePage() {
     }
   }
 
+  function openAttendanceSession(sessionId) {
+    if (!sessionId) return;
+    setSelectedSessionId(sessionId);
+    setActiveScheduleTab("attendance");
+    window.setTimeout(() => {
+      const panel = document.getElementById("attendance-panel");
+      if (!panel) return;
+      panel.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 120);
+  }
+
+  function toggleFixedCourseGroup(courseId) {
+    setExpandedFixedCourseIds((previous) => ({
+      ...previous,
+      [courseId]: !previous[courseId],
+    }));
+  }
+
+  function expandAllFixedCourseGroups() {
+    const next = {};
+    fixedWeeklyCourseGroups.forEach((group) => {
+      next[group.courseId] = true;
+    });
+    setExpandedFixedCourseIds(next);
+  }
+
+  function collapseAllFixedCourseGroups() {
+    const next = {};
+    fixedWeeklyCourseGroups.forEach((group) => {
+      next[group.courseId] = false;
+    });
+    setExpandedFixedCourseIds(next);
+  }
+
+  function toggleUpcomingGroup(groupKey) {
+    setExpandedUpcomingGroups((previous) => ({
+      ...previous,
+      [groupKey]: !previous[groupKey],
+    }));
+  }
+
+  function renderRequestCard(request, options = {}) {
+    const tone = options.tone || null;
+    const draft = resolutionDrafts[request.id] || {};
+    const isProcessing = processingRequestId === request.id;
+    const isPending = request.status === "pending";
+    const deadlineMs = getRequestDeadlineMs(request);
+    const statusColors = {
+      pending: { color: "#a855f7", background: "#f3e8ff" },
+      approved: { color: "#15803d", background: "#dcfce7" },
+      rejected: { color: "#b91c1c", background: "#fee2e2" },
+    };
+    const statusStyle = statusColors[request.status] || statusColors.pending;
+
+    return (
+      <article
+        key={request.id}
+        style={{
+          borderRadius: "14px",
+          border: `1px solid ${tone?.cardBorder || "rgba(226,232,240,0.9)"}`,
+          padding: "16px",
+          backgroundColor: tone?.cardBg || "#f8fafc",
+          display: "grid",
+          gap: "10px",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: "10px",
+            alignItems: "center",
+          }}
+        >
+          <div>
+            <p style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
+              {request.studentName} · {request.studentEmail}
+            </p>
+            <p style={{ fontSize: "12px", color: "#334155", marginTop: "4px" }}>
+              Course: {request.courseTitle || request.courseId}
+            </p>
+            <p style={{ fontSize: "12px", color: "#64748b" }}>
+              Original session: {request.sessionDate} {request.sessionStartTime}
+            </p>
+            {request.requestedDate && (
+              <p style={{ fontSize: "12px", color: "#64748b" }}>
+                Preferred date: {request.requestedDate} {request.requestedTime}
+              </p>
+            )}
+            {deadlineMs && (
+              <p style={{ fontSize: "12px", color: "#0f172a", fontWeight: 600 }}>
+                Deadline reference: {new Date(deadlineMs).toLocaleString()}
+              </p>
+            )}
+            {request.message && (
+              <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>
+                Student note: {request.message}
+              </p>
+            )}
+          </div>
+          <div style={{ display: "grid", gap: "6px", justifyItems: "end" }}>
+            {!!tone && (
+              <span
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  padding: "4px 10px",
+                  borderRadius: "999px",
+                  fontSize: "11px",
+                  fontWeight: 700,
+                  color: tone.badgeColor,
+                  backgroundColor: tone.badgeBg,
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {tone.label}
+              </span>
+            )}
+            <span
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                padding: "4px 12px",
+                borderRadius: "999px",
+                fontSize: "12px",
+                fontWeight: 600,
+                color: statusStyle.color,
+                backgroundColor: statusStyle.background,
+                whiteSpace: "nowrap",
+              }}
+            >
+              {request.status}
+            </span>
+          </div>
+        </div>
+
+        {isPending ? (
+          <form style={{ display: "grid", gap: "10px" }}>
+            <div
+              style={{
+                display: "grid",
+                gap: "10px",
+                gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+              }}
+            >
+              <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
+                New date
+                <input
+                  type="date"
+                  value={draft.newDate ?? request.requestedDate ?? ""}
+                  onChange={(event) => updateResolutionDraft(request.id, "newDate", event.target.value)}
+                  style={{
+                    padding: "8px 10px",
+                    borderRadius: "10px",
+                    border: "1px solid #cbd5f5",
+                    backgroundColor: "white",
+                    color: "#0f172a",
+                    colorScheme: "light",
+                    fontSize: "13px",
+                  }}
+                />
+              </label>
+              <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
+                New time
+                <input
+                  type="time"
+                  value={draft.newTime ?? request.requestedTime ?? ""}
+                  onChange={(event) => updateResolutionDraft(request.id, "newTime", event.target.value)}
+                  style={{
+                    padding: "8px 10px",
+                    borderRadius: "10px",
+                    border: "1px solid #cbd5f5",
+                    backgroundColor: "white",
+                    color: "#0f172a",
+                    colorScheme: "light",
+                    fontSize: "13px",
+                  }}
+                />
+              </label>
+            </div>
+
+            <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
+              Instructor note
+              <textarea
+                value={draft.note ?? ""}
+                onChange={(event) => updateResolutionDraft(request.id, "note", event.target.value)}
+                rows={3}
+                placeholder="Optional note for the student."
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: "10px",
+                  border: "1px solid #cbd5f5",
+                  backgroundColor: "white",
+                  color: "#0f172a",
+                  colorScheme: "light",
+                  fontSize: "13px",
+                  resize: "vertical",
+                }}
+              />
+            </label>
+
+            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                onClick={() => handleResolveRequest(request, "approved")}
+                disabled={isProcessing}
+                style={{
+                  padding: "8px 16px",
+                  borderRadius: "10px",
+                  border: "none",
+                  backgroundColor: isProcessing ? "#94a3b8" : "#22c55e",
+                  color: "white",
+                  fontWeight: 600,
+                  cursor: isProcessing ? "not-allowed" : "pointer",
+                }}
+              >
+                Approve
+              </button>
+              <button
+                type="button"
+                onClick={() => handleResolveRequest(request, "rejected")}
+                disabled={isProcessing}
+                style={{
+                  padding: "8px 16px",
+                  borderRadius: "10px",
+                  border: "1px solid rgba(239,68,68,0.4)",
+                  backgroundColor: "white",
+                  color: "#b91c1c",
+                  fontWeight: 600,
+                  cursor: isProcessing ? "not-allowed" : "pointer",
+                }}
+              >
+                Decline
+              </button>
+            </div>
+          </form>
+        ) : (
+          <p style={{ fontSize: "12px", color: "#475569" }}>
+            Resolved on {request.resolvedAt ? new Date(request.resolvedAt).toLocaleString() : "N/A"}
+            {request.resolutionNote ? ` · Note: ${request.resolutionNote}` : ""}
+          </p>
+        )}
+
+        {!isPending && (
+          <button
+            type="button"
+            onClick={() => handleDeleteResolvedRequest(request.id)}
+            style={{
+              padding: "6px 12px",
+              borderRadius: "999px",
+              border: "1px solid rgba(239,68,68,0.4)",
+              backgroundColor: "white",
+              color: "#b91c1c",
+              fontSize: "12px",
+              fontWeight: 600,
+              cursor: "pointer",
+              justifySelf: "start",
+            }}
+          >
+            Remove from list
+          </button>
+        )}
+      </article>
+    );
+  }
+
   async function handleOpenFixedAttendance(slot) {
     if (!sessionUser?.uid || !slot?.courseId) return;
 
@@ -615,7 +1200,7 @@ export default function TeacherSchedulePage() {
     try {
       const scheduledSession = nearestUpcomingSessionByCourse.get(slot.courseId);
       if (scheduledSession) {
-        setSelectedSessionId(scheduledSession.id);
+        openAttendanceSession(scheduledSession.id);
         return;
       }
 
@@ -634,7 +1219,7 @@ export default function TeacherSchedulePage() {
       });
 
       if (existingSession) {
-        setSelectedSessionId(existingSession.id);
+        openAttendanceSession(existingSession.id);
         return;
       }
 
@@ -656,7 +1241,7 @@ export default function TeacherSchedulePage() {
         createdAt: serverTimestamp(),
       });
 
-      setSelectedSessionId(createdSession.id);
+      openAttendanceSession(createdSession.id);
     } catch (error) {
       console.error("Failed to open fixed attendance session", error);
       alert("Unable to open attendance for this weekly slot right now.");
@@ -695,7 +1280,7 @@ export default function TeacherSchedulePage() {
     <main
       style={{
         minHeight: "100vh",
-        background: "linear-gradient(180deg, #edf3ff 0%, #f8fbff 42%, #ffffff 100%)",
+        background: "linear-gradient(180deg, #f2f6fc 0%, #f7faff 45%, #ffffff 100%)",
         fontFamily: "'Manrope', 'Segoe UI', 'Trebuchet MS', sans-serif",
         padding: "38px 20px 56px",
       }}
@@ -705,9 +1290,9 @@ export default function TeacherSchedulePage() {
           maxWidth: "1320px",
           margin: "0 auto",
           borderRadius: "26px",
-          backgroundColor: "rgba(255,255,255,0.98)",
+          backgroundColor: "#ffffff",
           boxShadow: "0 24px 70px rgba(15, 23, 42, 0.12)",
-          border: "1px solid rgba(203,213,225,0.65)",
+          border: "1px solid rgba(191,219,254,0.45)",
           padding: "34px",
           display: "grid",
           gap: "24px",
@@ -779,31 +1364,35 @@ export default function TeacherSchedulePage() {
           }}
         >
           {[
-            { href: "#create-session", label: "Create Session" },
-            { href: "#fixed-slots", label: "Fixed Slots" },
-            { href: "#upcoming-sessions", label: "Upcoming" },
-            { href: "#attendance-panel", label: "Attendance" },
-            { href: "#reschedule-requests", label: "Requests" },
-          ].map((item) => (
-            <a
-              key={item.href}
-              href={item.href}
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                padding: "7px 12px",
-                borderRadius: "999px",
-                fontSize: "12px",
-                fontWeight: 600,
-                color: "#334155",
-                textDecoration: "none",
-                border: "1px solid rgba(148,163,184,0.35)",
-                backgroundColor: "white",
-              }}
-            >
-              {item.label}
-            </a>
-          ))}
+            { key: "calendar", label: "Calendar" },
+            { key: "attendance", label: "Attendance" },
+            { key: "requests", label: `Requests (${pendingRequests.length})` },
+          ].map((item) => {
+            const isActive = activeScheduleTab === item.key;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => setActiveScheduleTab(item.key)}
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  padding: "7px 12px",
+                  borderRadius: "999px",
+                  fontSize: "12px",
+                  fontWeight: 700,
+                  color: isActive ? "#0369a1" : "#334155",
+                  border: isActive
+                    ? "1px solid rgba(14,165,233,0.5)"
+                    : "1px solid rgba(148,163,184,0.35)",
+                  backgroundColor: isActive ? "rgba(224,242,254,0.85)" : "white",
+                  cursor: "pointer",
+                }}
+              >
+                {item.label}
+              </button>
+            );
+          })}
         </div>
 
         {/* 两列布局：左主体，右侧粘性概要/待办 */}
@@ -817,14 +1406,16 @@ export default function TeacherSchedulePage() {
         >
           {/* 左列 */}
           <div style={{ display: "grid", gap: "18px" }}>
+            {activeScheduleTab === "calendar" && (
+            <>
             {/* 创建会话表单 */}
             <section
               id="create-session"
               style={{
                 borderRadius: "20px",
-                border: "1px solid rgba(226,232,240,0.7)",
+                border: "1px solid rgba(203,213,225,0.75)",
                 padding: "24px",
-                backgroundColor: "white",
+                backgroundColor: "#fbfdff",
                 display: "grid",
                 gap: "14px",
               }}
@@ -1056,51 +1647,83 @@ export default function TeacherSchedulePage() {
         </div>
       </form>
             </section>
+            </>
+            )}
 
-            {fixedWeeklySlots.length > 0 && (
+            {activeScheduleTab === "calendar" && fixedWeeklyCourseGroups.length > 0 && (
               <section
                 id="fixed-slots"
                 style={{
                   borderRadius: "20px",
-                  border: "1px solid rgba(226,232,240,0.7)",
+                  border: "1px solid rgba(203,213,225,0.75)",
                   padding: "18px",
-                  backgroundColor: "white",
+                  backgroundColor: "#fbfdff",
                   display: "grid",
                   gap: "12px",
                 }}
               >
-                <header style={{ display: "grid", gap: "4px" }}>
-                  <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
-                    RECURRING CLASSES
-                  </p>
-                  <h3 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
-                    Fixed weekly slots
-                  </h3>
-                  <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>
-                    Use this to mark attendance for regular classes. A session is auto-created if needed.
-                  </p>
+                <header
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "flex-start",
+                    gap: "12px",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div style={{ display: "grid", gap: "4px" }}>
+                    <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
+                      RECURRING CLASSES
+                    </p>
+                    <h3 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
+                      Fixed weekly slots
+                    </h3>
+                    <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>
+                      Grouped by course. Expand to view slot details and jump to attendance.
+                    </p>
+                  </div>
+                  <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      onClick={expandAllFixedCourseGroups}
+                      style={{
+                        padding: "6px 10px",
+                        borderRadius: "999px",
+                        border: "1px solid rgba(14,165,233,0.35)",
+                        backgroundColor: "rgba(224,242,254,0.85)",
+                        color: "#0369a1",
+                        fontSize: "12px",
+                        fontWeight: 700,
+                        cursor: "pointer",
+                      }}
+                    >
+                      Expand all
+                    </button>
+                    <button
+                      type="button"
+                      onClick={collapseAllFixedCourseGroups}
+                      style={{
+                        padding: "6px 10px",
+                        borderRadius: "999px",
+                        border: "1px solid rgba(148,163,184,0.4)",
+                        backgroundColor: "white",
+                        color: "#334155",
+                        fontSize: "12px",
+                        fontWeight: 700,
+                        cursor: "pointer",
+                      }}
+                    >
+                      Collapse all
+                    </button>
+                  </div>
                 </header>
 
                 <div style={{ display: "grid", gap: "10px" }}>
-                  {fixedWeeklySlots.map((slot) => {
-                    const nextOccurrence = getNextSlotOccurrence(slot.dayLabel, slot.startTime);
-                    const scheduledSession = nearestUpcomingSessionByCourse.get(slot.courseId) || null;
-                    const matchingSession = nextOccurrence
-                      ? sessions.find((session) => {
-                          if (session.archived) return false;
-                          if ((session.courseId || "") !== slot.courseId) return false;
-                          if ((session.date || "") !== nextOccurrence.dateKey) return false;
-                          if (!slot.startTime) return true;
-                          return (session.startTime || "") === slot.startTime;
-                        })
-                      : null;
-                    const usingScheduledSession =
-                      !!scheduledSession && (!matchingSession || scheduledSession.id !== matchingSession.id);
-                    const isCreating = creatingFixedSessionKey === slot.key;
-
+                  {fixedWeeklyCourseGroups.map((group) => {
+                    const isExpanded = expandedFixedCourseIds[group.courseId] ?? false;
                     return (
                       <article
-                        key={slot.key}
+                        key={group.courseId}
                         style={{
                           borderRadius: "14px",
                           border: "1px solid rgba(226,232,240,0.9)",
@@ -1110,76 +1733,207 @@ export default function TeacherSchedulePage() {
                           gap: "10px",
                         }}
                       >
-                        <div
+                        <button
+                          type="button"
+                          onClick={() => toggleFixedCourseGroup(group.courseId)}
                           style={{
                             display: "flex",
                             justifyContent: "space-between",
                             alignItems: "center",
                             gap: "10px",
                             flexWrap: "wrap",
+                            padding: 0,
+                            border: "none",
+                            backgroundColor: "transparent",
+                            cursor: "pointer",
+                            textAlign: "left",
                           }}
                         >
                           <div>
                             <p style={{ margin: 0, fontSize: "14px", fontWeight: 600, color: "#0f172a" }}>
-                              {slot.courseTitle}
-                            </p>
-                            <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#475569" }}>
-                              {slot.slotLabel}
+                              {group.courseTitle}
                             </p>
                             <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#94a3b8" }}>
-                              {slot.studentCount} paid student{slot.studentCount > 1 ? "s" : ""} enrolled
+                              {group.slots.length} slot{group.slots.length > 1 ? "s" : ""} ·{" "}
+                              {group.studentCount} student{group.studentCount > 1 ? "s" : ""}
                             </p>
-                            {nextOccurrence && (
-                              <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#64748b" }}>
-                                Next class: {nextOccurrence.dateTime.toLocaleString()}
-                              </p>
-                            )}
-                            {usingScheduledSession && (
-                              <p style={{ margin: "4px 0 0", fontSize: "12px", color: "#0f766e" }}>
-                                Scheduled session will open: {formatSessionDateTime(scheduledSession)}
-                              </p>
-                            )}
                           </div>
-
-                          <button
-                            type="button"
-                            onClick={() => handleOpenFixedAttendance(slot)}
-                            disabled={isCreating}
+                          <span
                             style={{
-                              padding: "8px 14px",
+                              display: "inline-flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              minWidth: "28px",
+                              height: "28px",
                               borderRadius: "10px",
-                              border: "1px solid rgba(34,197,94,0.4)",
+                              border: "1px solid rgba(148,163,184,0.35)",
                               backgroundColor: "white",
-                              color: "#15803d",
+                              color: "#334155",
                               fontWeight: 600,
-                              cursor: isCreating ? "not-allowed" : "pointer",
-                              opacity: isCreating ? 0.6 : 1,
                             }}
                           >
-                            {isCreating
-                              ? "Opening..."
-                              : usingScheduledSession
-                              ? "Open scheduled session"
-                              : matchingSession
-                              ? "Open attendance"
-                              : "Create next fixed session"}
-                          </button>
-                        </div>
+                            {isExpanded ? "−" : "+"}
+                          </span>
+                        </button>
+
+                        {isExpanded && (
+                          <div style={{ display: "grid", gap: "8px" }}>
+                            {group.slots.map((slot) => {
+                              const isCreating = creatingFixedSessionKey === slot.key;
+                              const studentPreview = slot.students.slice(0, 2);
+                              const hiddenStudentCount = Math.max(0, slot.students.length - studentPreview.length);
+                              return (
+                                <div
+                                  key={slot.key}
+                                  style={{
+                                    borderRadius: "12px",
+                                    border: "1px solid rgba(203,213,225,0.9)",
+                                    padding: "10px 12px",
+                                    backgroundColor: "white",
+                                    display: "flex",
+                                    justifyContent: "space-between",
+                                    alignItems: "center",
+                                    gap: "10px",
+                                    flexWrap: "wrap",
+                                  }}
+                                >
+                                  <div style={{ display: "grid", gap: "6px" }}>
+                                    <p style={{ margin: 0, fontSize: "13px", color: "#0f172a", fontWeight: 600 }}>
+                                      {slot.slotLabel}
+                                    </p>
+                                    <div style={{ display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                                      {studentPreview.map((student) => (
+                                        <span
+                                          key={`${slot.key}-${student.studentUid || student.studentEmail}`}
+                                          style={{
+                                            display: "inline-flex",
+                                            alignItems: "center",
+                                            padding: "2px 8px",
+                                            borderRadius: "999px",
+                                            fontSize: "11px",
+                                            color: "#1d4ed8",
+                                            backgroundColor: "rgba(219,234,254,0.9)",
+                                            fontWeight: 600,
+                                          }}
+                                        >
+                                          {student.studentName}
+                                        </span>
+                                      ))}
+                                      {hiddenStudentCount > 0 && (
+                                        <span
+                                          style={{
+                                            display: "inline-flex",
+                                            alignItems: "center",
+                                            padding: "2px 8px",
+                                            borderRadius: "999px",
+                                            fontSize: "11px",
+                                            color: "#334155",
+                                            backgroundColor: "rgba(226,232,240,0.85)",
+                                            fontWeight: 600,
+                                          }}
+                                        >
+                                          +{hiddenStudentCount} more
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p style={{ margin: 0, fontSize: "12px", color: "#64748b" }}>
+                                      Next class: {slot.nextLabel}
+                                    </p>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleOpenFixedAttendance(slot)}
+                                    disabled={isCreating}
+                                    style={{
+                                      padding: "8px 12px",
+                                      borderRadius: "10px",
+                                      border: "1px solid rgba(34,197,94,0.4)",
+                                      backgroundColor: "white",
+                                      color: "#15803d",
+                                      fontWeight: 600,
+                                      cursor: isCreating ? "not-allowed" : "pointer",
+                                      opacity: isCreating ? 0.6 : 1,
+                                      whiteSpace: "nowrap",
+                                    }}
+                                  >
+                                    {isCreating
+                                      ? "Opening..."
+                                      : slot.usingScheduledSession
+                                      ? "Open scheduled session"
+                                      : slot.matchingSession
+                                      ? "Open attendance"
+                                      : "Create next fixed session"}
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </article>
                     );
                   })}
                 </div>
               </section>
             )}
+
+            {activeScheduleTab === "requests" && (
+              <section
+                style={{
+                  borderRadius: "20px",
+                  border: "1px solid rgba(203,213,225,0.75)",
+                  padding: "20px",
+                  backgroundColor: "#fbfdff",
+                  display: "grid",
+                  gap: "8px",
+                }}
+              >
+                <h2 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
+                  Request operations
+                </h2>
+                <p style={{ margin: 0, fontSize: "13px", color: "#475569" }}>
+                  Use the right panel to approve or decline requests. Priority should go to pending requests.
+                </p>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      padding: "5px 10px",
+                      borderRadius: "999px",
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      color: "#7c3aed",
+                      backgroundColor: "rgba(233,213,255,0.7)",
+                    }}
+                  >
+                    Pending: {pendingRequests.length}
+                  </span>
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      padding: "5px 10px",
+                      borderRadius: "999px",
+                      fontSize: "12px",
+                      fontWeight: 700,
+                      color: "#0369a1",
+                      backgroundColor: "rgba(224,242,254,0.8)",
+                    }}
+                  >
+                    Total: {rescheduleRequests.length}
+                  </span>
+                </div>
+              </section>
+            )}
             {/* 即将到来 / 历史会话列表 */}
-            {sessionsByDate.upcoming.length > 0 && (
+            {(activeScheduleTab === "calendar" || activeScheduleTab === "attendance") && (
               <section
                 id="upcoming-sessions"
                 style={{
                   borderRadius: "20px",
-                  border: "1px solid rgba(226,232,240,0.7)",
+                  border: "1px solid rgba(203,213,225,0.75)",
                   padding: "18px",
-                  backgroundColor: "white",
+                  backgroundColor: "#fbfdff",
                   display: "grid",
                   gap: "12px",
                 }}
@@ -1190,30 +1944,197 @@ export default function TeacherSchedulePage() {
                       SESSION QUEUE
                     </p>
                     <h3 style={{ margin: "4px 0 0", fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>Upcoming sessions</h3>
-                    <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>Next lessons you have scheduled.</p>
+                    <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>
+                      Showing {filteredUpcomingSessions.length} of {sessionsByDate.upcoming.length} scheduled sessions.
+                    </p>
                   </div>
                 </header>
-                <div style={{ display: "grid", gap: "10px" }}>
-                  {sessionsByDate.upcoming.map((session) => (
-                    <SessionCard
-                      key={session.id}
-                      session={session}
-                      course={courseCatalog.find((c) => c.id === session.courseId)}
-                      onManage={() => setSelectedSessionId(session.id)}
-                      onDelete={() => handleDeleteSession(session.id)}
+                <div
+                  style={{
+                    display: "flex",
+                    gap: "10px",
+                    flexWrap: "wrap",
+                    alignItems: "flex-start",
+                  }}
+                >
+                  <label
+                    style={{
+                      display: "grid",
+                      gap: "5px",
+                      fontSize: "12px",
+                      color: "#334155",
+                      fontWeight: 600,
+                      flex: "1 1 260px",
+                      minWidth: "260px",
+                    }}
+                  >
+                    Course
+                    <select
+                      value={sessionCourseFilter}
+                      onChange={(event) => setSessionCourseFilter(event.target.value)}
+                      style={{
+                        padding: "9px 11px",
+                        borderRadius: "10px",
+                        border: "1px solid rgba(148,163,184,0.45)",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        fontSize: "13px",
+                      }}
+                    >
+                      <option value="all">All courses</option>
+                      {sessionCourseOptions.map((course) => (
+                        <option key={course.id} value={course.id}>
+                          {course.title}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label
+                    style={{
+                      display: "grid",
+                      gap: "5px",
+                      fontSize: "12px",
+                      color: "#334155",
+                      fontWeight: 600,
+                      flex: "1 1 200px",
+                      minWidth: "200px",
+                    }}
+                  >
+                    Range
+                    <select
+                      value={sessionRangeFilter}
+                      onChange={(event) => setSessionRangeFilter(event.target.value)}
+                      style={{
+                        padding: "9px 11px",
+                        borderRadius: "10px",
+                        border: "1px solid rgba(148,163,184,0.45)",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        fontSize: "13px",
+                      }}
+                    >
+                      <option value="all">All upcoming</option>
+                      <option value="today">Today</option>
+                      <option value="next7">Next 7 days</option>
+                    </select>
+                  </label>
+                  <label
+                    style={{
+                      display: "grid",
+                      gap: "5px",
+                      fontSize: "12px",
+                      color: "#334155",
+                      fontWeight: 600,
+                      flex: "1 1 320px",
+                      minWidth: "260px",
+                    }}
+                  >
+                    Search
+                    <input
+                      type="search"
+                      value={sessionSearchKeyword}
+                      onChange={(event) => setSessionSearchKeyword(event.target.value)}
+                      placeholder="Search title, date, location..."
+                      style={{
+                        padding: "9px 11px",
+                        borderRadius: "10px",
+                        border: "1px solid rgba(148,163,184,0.45)",
+                        backgroundColor: "white",
+                        color: "#0f172a",
+                        fontSize: "13px",
+                      }}
                     />
-                  ))}
+                  </label>
+                </div>
+                <div style={{ display: "grid", gap: "10px" }}>
+                  {filteredUpcomingSessions.length === 0 ? (
+                    <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>
+                      No upcoming sessions match your current filters.
+                    </p>
+                  ) : (
+                    <div style={{ display: "grid", gap: "10px" }}>
+                      {upcomingSessionGroups
+                        .filter((group) => group.sessions.length > 0)
+                        .map((group) => {
+                          const isExpanded = expandedUpcomingGroups[group.key] ?? true;
+                          return (
+                            <article
+                              key={group.key}
+                              style={{
+                                borderRadius: "12px",
+                                border: "1px solid rgba(226,232,240,0.9)",
+                                backgroundColor: "#f8fafc",
+                                padding: "10px",
+                                display: "grid",
+                                gap: "10px",
+                              }}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => toggleUpcomingGroup(group.key)}
+                                style={{
+                                  display: "flex",
+                                  justifyContent: "space-between",
+                                  alignItems: "center",
+                                  gap: "8px",
+                                  border: "none",
+                                  backgroundColor: "transparent",
+                                  padding: 0,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                <span style={{ fontSize: "13px", fontWeight: 700, color: "#0f172a" }}>
+                                  {group.label} ({group.sessions.length})
+                                </span>
+                                <span
+                                  style={{
+                                    display: "inline-flex",
+                                    alignItems: "center",
+                                    justifyContent: "center",
+                                    minWidth: "24px",
+                                    height: "24px",
+                                    borderRadius: "8px",
+                                    border: "1px solid rgba(148,163,184,0.4)",
+                                    backgroundColor: "white",
+                                    color: "#334155",
+                                    fontSize: "12px",
+                                    fontWeight: 700,
+                                  }}
+                                >
+                                  {isExpanded ? "−" : "+"}
+                                </span>
+                              </button>
+
+                              {isExpanded && (
+                                <div style={{ display: "grid", gap: "10px" }}>
+                                  {group.sessions.map((session) => (
+                                    <SessionCard
+                                      key={session.id}
+                                      session={session}
+                                      course={courseCatalog.find((c) => c.id === session.courseId)}
+                                      onManage={() => openAttendanceSession(session.id)}
+                                      onDelete={() => handleDeleteSession(session.id)}
+                                    />
+                                  ))}
+                                </div>
+                              )}
+                            </article>
+                          );
+                        })}
+                    </div>
+                  )}
                 </div>
               </section>
             )}
 
-            {sessionsByDate.past.length > 0 && (
+            {(activeScheduleTab === "calendar" || activeScheduleTab === "attendance") &&
+              sessionsByDate.past.length > 0 && (
               <section
                 style={{
                   borderRadius: "20px",
-                  border: "1px solid rgba(226,232,240,0.7)",
+                  border: "1px solid rgba(203,213,225,0.75)",
                   padding: "18px",
-                  backgroundColor: "white",
+                  backgroundColor: "#fbfdff",
                   display: "grid",
                   gap: "12px",
                 }}
@@ -1221,32 +2142,61 @@ export default function TeacherSchedulePage() {
                 <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px" }}>
                   <div>
                     <h3 style={{ margin: 0, fontSize: "18px", fontWeight: 700, color: "#0f172a" }}>Past sessions</h3>
-                    <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>Recent lessons already completed.</p>
+                    <p style={{ margin: 0, fontSize: "12px", color: "#475569" }}>
+                      Showing {filteredPastSessions.length} of {sessionsByDate.past.length} past sessions.
+                    </p>
                   </div>
                 </header>
                 <div style={{ display: "grid", gap: "10px" }}>
-                  {sessionsByDate.past.map((session) => (
-                    <SessionCard
-                      key={session.id}
-                      session={session}
-                      course={courseCatalog.find((c) => c.id === session.courseId)}
-                      onManage={() => setSelectedSessionId(session.id)}
-                      onDelete={() => handleDeleteSession(session.id)}
-                    />
-                  ))}
+                  {filteredPastSessions.length === 0 ? (
+                    <p style={{ margin: 0, fontSize: "13px", color: "#64748b" }}>
+                      No past sessions match your current filters.
+                    </p>
+                  ) : (
+                    filteredPastSessions.map((session) => (
+                      <SessionCard
+                        key={session.id}
+                        session={session}
+                        course={courseCatalog.find((c) => c.id === session.courseId)}
+                        onManage={() => openAttendanceSession(session.id)}
+                        onDelete={() => handleDeleteSession(session.id)}
+                      />
+                    ))
+                  )}
                 </div>
               </section>
             )}
 
+            {activeScheduleTab === "attendance" && !selectedSession && (
+              <section
+                id="attendance-panel"
+                style={{
+                  borderRadius: "20px",
+                  border: "1px solid rgba(203,213,225,0.75)",
+                  padding: "20px",
+                  backgroundColor: "#fbfdff",
+                  display: "grid",
+                  gap: "8px",
+                }}
+              >
+                <h2 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
+                  Attendance
+                </h2>
+                <p style={{ margin: 0, fontSize: "13px", color: "#475569" }}>
+                  Select a session from Upcoming sessions or Fixed weekly slots to start marking attendance.
+                </p>
+              </section>
+            )}
+
             {/* 出勤面板（若选中某会话） */}
-           {selectedSession && (
+           {activeScheduleTab === "attendance" && selectedSession && (
                  <section
                 id="attendance-panel"
                 style={{
                   borderRadius: "20px",
-                  border: "1px solid rgba(226,232,240,0.7)",
+                  border: "1px solid rgba(203,213,225,0.75)",
                   padding: "24px",
-                  backgroundColor: "white",
+                  backgroundColor: "#fbfdff",
                   display: "grid",
                   gap: "18px",
                 }}
@@ -1476,9 +2426,9 @@ export default function TeacherSchedulePage() {
             <div
               style={{
                 borderRadius: "20px",
-                border: "1px solid rgba(226,232,240,0.8)",
+                border: "1px solid rgba(191,219,254,0.55)",
                 padding: "18px",
-                backgroundColor: "white",
+                backgroundColor: "#fbfdff",
                 boxShadow: "0 12px 28px rgba(15,23,42,0.1)",
                 display: "grid",
                 gap: "10px",
@@ -1488,41 +2438,42 @@ export default function TeacherSchedulePage() {
                 This week at a glance
               </p>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
-                <div style={{ padding: "10px", borderRadius: "10px", background: "rgba(59,130,246,0.08)" }}>
+                <div style={{ padding: "10px", borderRadius: "10px", background: "#eff6ff" }}>
                   <p style={{ margin: 0, fontSize: "11px", color: "#2563eb", fontWeight: 700 }}>Upcoming</p>
                   <p style={{ margin: "4px 0 0", fontSize: "22px", fontWeight: 800, color: "#0f172a" }}>
                     {summaryCounts.upcomingCount}
                   </p>
                 </div>
-                <div style={{ padding: "10px", borderRadius: "10px", background: "rgba(34,197,94,0.08)" }}>
+                <div style={{ padding: "10px", borderRadius: "10px", background: "#f0fdf4" }}>
                   <p style={{ margin: 0, fontSize: "11px", color: "#15803d", fontWeight: 700 }}>This week</p>
                   <p style={{ margin: "4px 0 0", fontSize: "22px", fontWeight: 800, color: "#0f172a" }}>
                     {summaryCounts.thisWeekCount}
                   </p>
                 </div>
-                <div style={{ padding: "10px", borderRadius: "10px", background: "rgba(248,113,113,0.08)" }}>
+                <div style={{ padding: "10px", borderRadius: "10px", background: "#fff1f2" }}>
                   <p style={{ margin: 0, fontSize: "11px", color: "#b91c1c", fontWeight: 700 }}>Requests</p>
                   <p style={{ margin: "4px 0 0", fontSize: "22px", fontWeight: 800, color: "#0f172a" }}>
                     {pendingRequests.length}
                   </p>
                 </div>
-                <div style={{ padding: "10px", borderRadius: "10px", background: "rgba(14,165,233,0.08)" }}>
+                <div style={{ padding: "10px", borderRadius: "10px", background: "#ecfeff" }}>
                   <p style={{ margin: 0, fontSize: "11px", color: "#0369a1", fontWeight: 700 }}>Weekly slots</p>
                   <p style={{ margin: "4px 0 0", fontSize: "22px", fontWeight: 800, color: "#0f172a" }}>
-                    {fixedWeeklySlots.length}
+                    {fixedWeeklyCourseGroups.length}
                   </p>
                 </div>
               </div>
             </div>
 
             {/* Reschedule requests */}
+            {activeScheduleTab === "requests" && (
             <section
               id="reschedule-requests"
               style={{
                 borderRadius: "20px",
-                border: "1px solid rgba(226,232,240,0.7)",
+                border: "1px solid rgba(191,219,254,0.75)",
                 padding: "18px",
-                backgroundColor: "white",
+                backgroundColor: "#f8fbff",
                 display: "grid",
                 gap: "12px",
               }}
@@ -1562,10 +2513,10 @@ export default function TeacherSchedulePage() {
                       borderRadius: "999px",
                       border:
                         requestFilter === option.key
-                          ? "1px solid rgba(14,165,233,0.45)"
-                          : "1px solid rgba(148,163,184,0.35)",
-                      backgroundColor: requestFilter === option.key ? "rgba(224,242,254,0.8)" : "white",
-                      color: requestFilter === option.key ? "#0369a1" : "#475569",
+                          ? "1px solid rgba(37,99,235,0.5)"
+                          : "1px solid rgba(148,163,184,0.4)",
+                      backgroundColor: requestFilter === option.key ? "rgba(219,234,254,0.95)" : "white",
+                      color: requestFilter === option.key ? "#1d4ed8" : "#475569",
                       fontSize: "12px",
                       fontWeight: 600,
                       cursor: "pointer",
@@ -1573,6 +2524,49 @@ export default function TeacherSchedulePage() {
                   >
                     {option.label}
                   </button>
+                ))}
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
+                {[
+                  {
+                    label: "Overdue",
+                    value: pendingQueueCounts.overdue,
+                    color: "#b91c1c",
+                    bg: "rgba(254,226,226,0.9)",
+                  },
+                  {
+                    label: "Urgent",
+                    value: pendingQueueCounts.urgent,
+                    color: "#c2410c",
+                    bg: "rgba(255,237,213,0.9)",
+                  },
+                  {
+                    label: "This week",
+                    value: pendingQueueCounts.thisWeek,
+                    color: "#1d4ed8",
+                    bg: "rgba(219,234,254,0.9)",
+                  },
+                  {
+                    label: "Later",
+                    value: pendingQueueCounts.later,
+                    color: "#334155",
+                    bg: "rgba(226,232,240,0.85)",
+                  },
+                ].map((item) => (
+                  <div
+                    key={item.label}
+                    style={{
+                      borderRadius: "10px",
+                      padding: "8px 10px",
+                      backgroundColor: item.bg,
+                      display: "grid",
+                      gap: "2px",
+                    }}
+                  >
+                    <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, color: item.color }}>{item.label}</p>
+                    <p style={{ margin: 0, fontSize: "20px", fontWeight: 800, color: "#0f172a" }}>{item.value}</p>
+                  </div>
                 ))}
               </div>
 
@@ -1586,209 +2580,57 @@ export default function TeacherSchedulePage() {
                 </p>
               ) : (
                 <div style={{ display: "grid", gap: "12px", maxHeight: "900px", overflowY: "auto", paddingRight: "2px" }}>
-                {filteredRequests.map((request) => {
-                  const draft = resolutionDrafts[request.id] || {};
-                  const isProcessing = processingRequestId === request.id;
-                  const isPending = request.status === "pending";
-                  const statusColors = {
-                    pending: { color: "#a855f7", background: "#f3e8ff" },
-                    approved: { color: "#15803d", background: "#dcfce7" },
-                    rejected: { color: "#b91c1c", background: "#fee2e2" },
-                  };
-                  const statusStyle = statusColors[request.status] || statusColors.pending;
-
-                  return (
-                    <article
-                      key={request.id}
-                      style={{
-                        borderRadius: "14px",
-                        border: "1px solid rgba(226,232,240,0.9)",
-                        padding: "16px",
-                        backgroundColor: "#f8fafc",
-                        display: "grid",
-                        gap: "10px",
-                      }}
-                    >
-                      <div
-                        style={{
-                          display: "flex",
-                          justifyContent: "space-between",
-                          flexWrap: "wrap",
-                          gap: "10px",
-                          alignItems: "center",
-                        }}
-                      >
-                        <div>
-                          <p style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                            {request.studentName} · {request.studentEmail}
-                          </p>
-                          <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>
-                            Course: {request.courseTitle || request.courseId}
-                          </p>
-                          <p style={{ fontSize: "12px", color: "#94a3b8" }}>
-                            Original session: {request.sessionDate} {request.sessionStartTime}
-                          </p>
-                          {request.requestedDate && (
-                            <p style={{ fontSize: "12px", color: "#94a3b8" }}>
-                              Preferred date: {request.requestedDate} {request.requestedTime}
-                            </p>
-                          )}
-                          {request.message && (
-                            <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>
-                              Student note: {request.message}
-                            </p>
-                          )}
-                        </div>
-                        <span
+                  {filteredPendingRequestGroups
+                    .filter((group) => group.items.length > 0)
+                    .map((group) => (
+                      <section key={group.key} style={{ display: "grid", gap: "10px" }}>
+                        <div
                           style={{
                             display: "inline-flex",
                             alignItems: "center",
-                            padding: "4px 12px",
+                            padding: "5px 10px",
                             borderRadius: "999px",
                             fontSize: "12px",
-                            fontWeight: 600,
-                            color: statusStyle.color,
-                            backgroundColor: statusStyle.background,
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {request.status}
-                        </span>
-                      </div>
-
-                      {isPending ? (
-                        <form style={{ display: "grid", gap: "10px" }}>
-                          <div
-                            style={{
-                              display: "grid",
-                              gap: "10px",
-                              gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
-                            }}
-                          >
-                            <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
-                              New date
-                              <input
-                                type="date"
-                                value={draft.newDate ?? request.requestedDate ?? ""}
-                                onChange={(event) => updateResolutionDraft(request.id, "newDate", event.target.value)}
-                                style={{
-                                  padding: "8px 10px",
-                                  borderRadius: "10px",
-                                  border: "1px solid #cbd5f5",
-                                  backgroundColor: "white",
-                                  color: "#0f172a",
-                                  colorScheme: "light",
-                                  fontSize: "13px",
-                                }}
-                              />
-                            </label>
-                            <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
-                              New time
-                              <input
-                                type="time"
-                                value={draft.newTime ?? request.requestedTime ?? ""}
-                                onChange={(event) => updateResolutionDraft(request.id, "newTime", event.target.value)}
-                                style={{
-                                  padding: "8px 10px",
-                                  borderRadius: "10px",
-                                  border: "1px solid #cbd5f5",
-                                  backgroundColor: "white",
-                                  color: "#0f172a",
-                                  colorScheme: "light",
-                                  fontSize: "13px",
-                                }}
-                              />
-                            </label>
-                          </div>
-
-                          <label style={{ display: "grid", gap: "6px", fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
-                            Instructor note
-                            <textarea
-                              value={draft.note ?? ""}
-                              onChange={(event) => updateResolutionDraft(request.id, "note", event.target.value)}
-                              rows={3}
-                              placeholder="Optional note for the student."
-                              style={{
-                                padding: "10px 12px",
-                                borderRadius: "10px",
-                                border: "1px solid #cbd5f5",
-                                backgroundColor: "white",
-                                color: "#0f172a",
-                                colorScheme: "light",
-                                fontSize: "13px",
-                                resize: "vertical",
-                              }}
-                            />
-                          </label>
-
-                          <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-                            <button
-                              type="button"
-                              onClick={() => handleResolveRequest(request, "approved")}
-                              disabled={isProcessing}
-                              style={{
-                                padding: "8px 16px",
-                                borderRadius: "10px",
-                                border: "none",
-                                backgroundColor: isProcessing ? "#94a3b8" : "#22c55e",
-                                color: "white",
-                                fontWeight: 600,
-                                cursor: isProcessing ? "not-allowed" : "pointer",
-                              }}
-                            >
-                              Approve
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleResolveRequest(request, "rejected")}
-                              disabled={isProcessing}
-                              style={{
-                                padding: "8px 16px",
-                                borderRadius: "10px",
-                                border: "1px solid rgba(239,68,68,0.4)",
-                                backgroundColor: "white",
-                                color: "#b91c1c",
-                                fontWeight: 600,
-                                cursor: isProcessing ? "not-allowed" : "pointer",
-                              }}
-                            >
-                              Decline
-                            </button>
-                          </div>
-                        </form>
-                      ) : (
-                        <p style={{ fontSize: "12px", color: "#475569" }}>
-                          Resolved on{" "}
-                          {request.resolvedAt ? new Date(request.resolvedAt).toLocaleString() : "N/A"}
-                          {request.resolutionNote ? ` · Note: ${request.resolutionNote}` : ""}
-                        </p>
-                      )}
-
-                      {!isPending && (
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteResolvedRequest(request.id)}
-                          style={{
-                            padding: "6px 12px",
-                            borderRadius: "999px",
-                            border: "1px solid rgba(239,68,68,0.4)",
-                            backgroundColor: "white",
-                            color: "#b91c1c",
-                            fontSize: "12px",
-                            fontWeight: 600,
-                            cursor: "pointer",
+                            fontWeight: 700,
+                            color: group.badgeColor,
+                            backgroundColor: group.badgeBg,
                             justifySelf: "start",
                           }}
                         >
-                          Remove from list
-                        </button>
-                      )}
-                    </article>
-                  );
-                })}
+                          {group.label} ({group.items.length})
+                        </div>
+                        <div style={{ display: "grid", gap: "10px" }}>
+                          {group.items.map((request) => renderRequestCard(request, { tone: group }))}
+                        </div>
+                      </section>
+                    ))}
+
+                  {filteredResolvedRequests.length > 0 && (
+                    <section style={{ display: "grid", gap: "10px" }}>
+                      <div
+                        style={{
+                          display: "inline-flex",
+                          alignItems: "center",
+                          padding: "5px 10px",
+                          borderRadius: "999px",
+                          fontSize: "12px",
+                          fontWeight: 700,
+                          color: "#475569",
+                          backgroundColor: "rgba(226,232,240,0.85)",
+                          justifySelf: "start",
+                        }}
+                      >
+                        Resolved ({filteredResolvedRequests.length})
+                      </div>
+                      <div style={{ display: "grid", gap: "10px" }}>
+                        {filteredResolvedRequests.map((request) => renderRequestCard(request))}
+                      </div>
+                    </section>
+                  )}
                 </div>
               )}
             </section>
+            )}
           </aside>
         </div>
       </section>
