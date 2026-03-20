@@ -10,16 +10,12 @@ import {
 import { doc, getDoc, serverTimestamp, setDoc } from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
 
-const roles = [
-  { value: "student", label: "Student" },
-  { value: "teacher", label: "Teacher" },
-];
+const REGISTER_ROLE = "student";
 
 export default function RegisterPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [role, setRole] = useState(roles[0].value);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const googleProvider = new GoogleAuthProvider();
@@ -43,7 +39,7 @@ export default function RegisterPage() {
 
       await setDoc(doc(db, "users", credential.user.uid), {
         email: trimmedEmail,
-        role,
+        role: REGISTER_ROLE,
         createdAt: serverTimestamp(),
       });
 
@@ -67,14 +63,14 @@ export default function RegisterPage() {
       if (!profileSnap.exists()) {
         await setDoc(profileRef, {
           email: credential.user.email ?? "",
-          role,
+          role: REGISTER_ROLE,
           createdAt: serverTimestamp(),
         });
       }
 
       const nextRole = profileSnap.exists()
         ? profileSnap.data().role ?? "student"
-        : role;
+        : REGISTER_ROLE;
       const nextRoute = nextRole === "teacher" ? "/teacher/dashboard" : "/Dashboard";
       router.push(nextRoute);
     } catch (error) {
@@ -135,7 +131,7 @@ export default function RegisterPage() {
                 letterSpacing: "0.14em",
               }}
             >
-              BUILD YOUR LEARNING PARTNERSHIP
+              BUILD YOUR PRACTICE MOMENTUM
             </span>
             <div>
               <h1
@@ -147,10 +143,10 @@ export default function RegisterPage() {
                   margin: 0,
                 }}
               >
-                One platform connecting students and teachers
+                Your student piano learning hub
               </h1>
               <p style={{ marginTop: "14px", fontSize: "15px", color: "#475569", lineHeight: 1.6 }}>
-                Students get structured guidance while teachers gain clear oversight. Plan repertoire, track lessons, and celebrate every milestone together.
+                Create a student account to enrol in courses, track weekly progress, and receive lesson updates in one place.
               </p>
             </div>
           </header>
@@ -158,16 +154,16 @@ export default function RegisterPage() {
           <section style={{ display: "grid", gap: "18px" }}>
             {[
               {
-                title: "Student experience",
-                description: "Structured practice plans, progress visualisation, and instant lesson feedback.",
+                title: "Course enrolment",
+                description: "Browse available piano courses and join the right level for your learning goals.",
               },
               {
-                title: "Teacher workspace",
-                description: "Assign repertoire, review recorded submissions, and streamline lesson notes.",
+                title: "Practice tracking",
+                description: "Log practice sessions, monitor consistency, and keep your progress visible each week.",
               },
               {
-                title: "Admin console",
-                description: "Manage enrolments, payments, scheduling, and studio communications in one dashboard.",
+                title: "Lesson resources",
+                description: "Access shared materials, assignments, and feedback anytime from your dashboard.",
               },
             ].map((card) => (
               <div
@@ -200,13 +196,13 @@ export default function RegisterPage() {
             }}
           >
             <div>
-              <strong style={{ color: "#0f172a", fontSize: "16px" }}>250+</strong> active studios
+              <strong style={{ color: "#0f172a", fontSize: "16px" }}>1.2K+</strong> active learners
             </div>
             <div>
-              <strong style={{ color: "#0f172a", fontSize: "16px" }}>4.9/5</strong> learner satisfaction
+              <strong style={{ color: "#0f172a", fontSize: "16px" }}>4.9/5</strong> student satisfaction
             </div>
             <div>
-              <strong style={{ color: "#0f172a", fontSize: "16px" }}>24/7</strong> practice analytics
+              <strong style={{ color: "#0f172a", fontSize: "16px" }}>24/7</strong> practice access
             </div>
           </footer>
         </article>
@@ -268,29 +264,9 @@ export default function RegisterPage() {
               />
             </label>
 
-            <label style={{ display: "grid", gap: "8px" }}>
-              <span style={{ fontSize: "13px", fontWeight: 600, color: "#1e293b" }}>Select your role</span>
-              <select
-                id="role"
-                value={role}
-                onChange={(event) => setRole(event.target.value)}
-                style={{
-                  padding: "12px 14px",
-                  borderRadius: "10px",
-                  border: "1px solid #cbd5f5",
-                  backgroundColor: "#f8fafc",
-                  fontSize: "14px",
-                  color: "#0f172a",
-                  appearance: "none",
-                }}
-              >
-                {roles.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <p style={{ margin: 0, fontSize: "13px", color: "#475569" }}>
+              New registrations are created as student accounts.
+            </p>
           </div>
 
           <button
