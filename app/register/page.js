@@ -1,7 +1,7 @@
 ﻿"use client";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   GoogleAuthProvider,
   createUserWithEmailAndPassword,
@@ -12,20 +12,77 @@ import { auth, db } from "@/lib/firebase";
 
 const REGISTER_ROLE = "student";
 
+function getErrorCode(error) {
+  if (!(error instanceof Error)) return "";
+  if (!("code" in error)) return "";
+  return typeof error.code === "string" ? error.code : "";
+}
+
+function getFriendlyEmailRegisterErrorMessage(error) {
+  const errorCode = getErrorCode(error);
+  if (errorCode === "auth/invalid-email") {
+    return "Gmail format is invalid. Please check your Gmail.";
+  }
+  if (errorCode === "auth/email-already-in-use") {
+    return "This Gmail is already registered. Please sign in instead.";
+  }
+  if (errorCode === "auth/weak-password") {
+    return "Password is too weak. Please use at least 6 characters.";
+  }
+  if (errorCode === "auth/network-request-failed") {
+    return "Network error. Please check your connection and try again.";
+  }
+  if (errorCode === "auth/too-many-requests") {
+    return "Too many attempts. Please try again later.";
+  }
+  return "Registration failed. Please check your Gmail and password.";
+}
+
+function getFriendlyGoogleRegisterErrorMessage(error) {
+  const errorCode = getErrorCode(error);
+  if (errorCode === "auth/popup-closed-by-user") {
+    return "Google sign-up was cancelled. Please try again.";
+  }
+  if (errorCode === "auth/popup-blocked") {
+    return "Popup was blocked by browser. Please allow popups and try again.";
+  }
+  if (errorCode === "auth/account-exists-with-different-credential") {
+    return "This Gmail is already linked with a different sign-in method.";
+  }
+  if (errorCode === "auth/network-request-failed") {
+    return "Network error. Please check your connection and try again.";
+  }
+  return "Google registration failed. Please try again.";
+}
+
 export default function RegisterPage() {
   const router = useRouter();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [notice, setNotice] = useState(null);
+  const redirectTimeoutRef = useRef(null);
 
   const googleProvider = new GoogleAuthProvider();
+
+  useEffect(() => {
+    return () => {
+      if (redirectTimeoutRef.current) {
+        clearTimeout(redirectTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  function openNotice(type, title, message) {
+    setNotice({ type, title, message });
+  }
 
   async function handleSubmit(event) {
     event.preventDefault();
 
     const trimmedEmail = email.trim();
     if (!trimmedEmail || !password) {
-      alert("Please enter email and password");
+      openNotice("warning", "Missing details", "Please enter both email and password.");
       return;
     }
 
@@ -43,11 +100,25 @@ export default function RegisterPage() {
         createdAt: serverTimestamp(),
       });
 
-      alert("Registration successful. Please login.");
-      router.push("/");
+      openNotice(
+        "success",
+        "Account created",
+        "Registration successful. Redirecting to sign in..."
+      );
+
+      if (redirectTimeoutRef.current) {
+        clearTimeout(redirectTimeoutRef.current);
+      }
+      redirectTimeoutRef.current = setTimeout(() => {
+        router.push("/");
+      }, 1400);
     } catch (error) {
       console.error("Failed to register user", error);
-      alert(error instanceof Error ? error.message : "Failed to register. Please try again.");
+      openNotice(
+        "error",
+        "Registration failed",
+        getFriendlyEmailRegisterErrorMessage(error)
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -75,7 +146,11 @@ export default function RegisterPage() {
       router.push(nextRoute);
     } catch (error) {
       console.error("Failed to register with Google", error);
-      alert(error instanceof Error ? error.message : "Google registration failed. Please try again.");
+      openNotice(
+        "error",
+        "Google registration failed",
+        getFriendlyGoogleRegisterErrorMessage(error)
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -325,6 +400,66 @@ export default function RegisterPage() {
           </p>
         </form>
       </section>
+
+      {notice && (
+        <aside
+          role="status"
+          aria-live="polite"
+          style={{
+            position: "fixed",
+            right: "20px",
+            top: "20px",
+            maxWidth: "360px",
+            width: "calc(100% - 40px)",
+            borderRadius: "16px",
+            backgroundColor: "rgba(15, 23, 42, 0.96)",
+            color: "#e2e8f0",
+            boxShadow: "0 24px 48px rgba(2, 6, 23, 0.45)",
+            border: `1px solid ${
+              notice.type === "success"
+                ? "rgba(34, 197, 94, 0.45)"
+                : notice.type === "warning"
+                  ? "rgba(251, 191, 36, 0.45)"
+                  : "rgba(239, 68, 68, 0.45)"
+            }`,
+            padding: "16px 18px",
+            zIndex: 30,
+            display: "grid",
+            gap: "10px",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "10px" }}>
+            <strong
+              style={{
+                fontSize: "14px",
+                color:
+                  notice.type === "success"
+                    ? "#86efac"
+                    : notice.type === "warning"
+                      ? "#fcd34d"
+                      : "#fca5a5",
+              }}
+            >
+              {notice.title}
+            </strong>
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              style={{
+                border: "none",
+                background: "transparent",
+                color: "#cbd5e1",
+                fontSize: "13px",
+                cursor: "pointer",
+                padding: "0",
+              }}
+            >
+              Close
+            </button>
+          </div>
+          <p style={{ margin: 0, lineHeight: 1.5, fontSize: "13px" }}>{notice.message}</p>
+        </aside>
+      )}
     </main>
   );
 }
