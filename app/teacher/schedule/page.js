@@ -31,6 +31,15 @@ const WEEKDAY_TOKENS = [
   ["sat", 6],
 ];
 
+const INACTIVE_ENROLLMENT_STATUSES = new Set([
+  "cancelled",
+  "canceled",
+  "withdrawn",
+  "inactive",
+  "refunded",
+]);
+const RESOLVED_REQUESTS_BATCH = 20;
+
 function parseWeekdayIndexes(dayLabel) {
   const normalized = (dayLabel || "").toLowerCase();
   if (!normalized) return [];
@@ -49,6 +58,53 @@ function parseWeekdayIndexes(dayLabel) {
   }
 
   return Array.from(indices);
+}
+
+function normalizeEnrollmentWeekdays(rawDays) {
+  if (!Array.isArray(rawDays)) return [];
+  const indices = new Set();
+  for (const value of rawDays) {
+    const parsed = Number(value);
+    if (!Number.isInteger(parsed)) continue;
+    if (parsed >= 0 && parsed <= 6) {
+      indices.add(parsed);
+    } else if (parsed >= 1 && parsed <= 7) {
+      indices.add(parsed % 7);
+    }
+  }
+  return Array.from(indices);
+}
+
+function getEnrollmentWeekdayIndexes(enrollment) {
+  const fromStoredDays = normalizeEnrollmentWeekdays(enrollment?.timeSlotDays);
+  if (fromStoredDays.length) return fromStoredDays;
+  const dayLabel = String(enrollment?.timeSlotDay || "").trim();
+  const slotLabel = String(enrollment?.timeSlotLabel || "").trim();
+  return parseWeekdayIndexes(dayLabel || slotLabel);
+}
+
+function normalizeDateValue(dateValue) {
+  if (dateValue === null || dateValue === undefined) return "";
+  const raw = String(dateValue).trim();
+  if (!raw) return "";
+  const normalized = raw.replace(/[./]/g, "-");
+  const matched = normalized.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (!matched) return raw;
+  const [, year, month, day] = matched;
+  return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+}
+
+function normalizeTimeValue(timeValue) {
+  if (timeValue === null || timeValue === undefined) return "";
+  const raw = String(timeValue).trim();
+  if (!raw) return "";
+  const matched = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!matched) return "";
+  const hour = Number.parseInt(matched[1], 10);
+  const minute = Number.parseInt(matched[2], 10);
+  if (!Number.isFinite(hour) || hour < 0 || hour > 23) return "";
+  if (!Number.isFinite(minute) || minute < 0 || minute > 59) return "";
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
 }
 
 function formatDateKey(dateValue) {
@@ -93,32 +149,70 @@ function getNextSlotOccurrence(dayLabel, startTime) {
 }
 
 function hasPaidAccess(enrollment) {
-  return enrollment?.paymentStatus === "paid" || enrollment?.status === "Paid";
+  if (!enrollment) return false;
+  const paymentStatus = String(enrollment.paymentStatus || "").toLowerCase();
+  const status = String(enrollment.status || "").toLowerCase();
+  if (INACTIVE_ENROLLMENT_STATUSES.has(paymentStatus) || INACTIVE_ENROLLMENT_STATUSES.has(status)) {
+    return false;
+  }
+  return (
+    paymentStatus === "paid" ||
+    status === "paid" ||
+    Boolean(enrollment.paidAt || enrollment.paymentIntentId || enrollment.paymentReceiptUrl)
+  );
 }
 
 function formatSessionDateTime(session) {
   if (!session?.date) return "Date TBA";
-  const parsed = new Date(`${session.date}T${session.startTime || "00:00"}`);
-  if (Number.isNaN(parsed.getTime())) {
+  const stamp = parseDateTimeMs(session.date, session.startTime || "00:00");
+  if (!Number.isFinite(stamp)) {
     return `${session.date}${session.startTime ? ` ${session.startTime}` : ""}`;
   }
-  return parsed.toLocaleString();
+  return new Date(stamp).toLocaleString();
 }
 
 function getSessionTimestamp(session) {
   if (!session?.date) return null;
-  const parsed = new Date(`${session.date}T${session.startTime || "00:00"}`);
-  const stamp = parsed.getTime();
-  return Number.isNaN(stamp) ? null : stamp;
+  return parseDateTimeMs(session.date, session.startTime || "00:00");
+}
+
+function toMillis(value) {
+  if (!value) return NaN;
+  if (typeof value?.toDate === "function") {
+    const date = value.toDate();
+    return date instanceof Date ? date.getTime() : NaN;
+  }
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+function getEnrollmentActiveFromMs(enrollment) {
+  const candidates = [
+    enrollment?.slotActivatedAt,
+    enrollment?.updatedAt,
+    enrollment?.paidAt,
+    enrollment?.enrolledAt,
+  ];
+  let activeFromMs = 0;
+  for (const value of candidates) {
+    const ms = toMillis(value);
+    if (Number.isFinite(ms) && ms > activeFromMs) {
+      activeFromMs = ms;
+    }
+  }
+  return activeFromMs;
 }
 
 function parseDateTimeMs(dateValue, timeValue = "00:00") {
-  if (!dateValue || typeof dateValue !== "string") return null;
-  const time = String(timeValue || "00:00").slice(0, 5);
-  const normalizedTime = /^\d{2}:\d{2}$/.test(time) ? time : "00:00";
-  const parsed = new Date(`${dateValue}T${normalizedTime}`);
+  const normalizedDate = normalizeDateValue(dateValue);
+  if (!normalizedDate) return null;
+  const normalizedTime = normalizeTimeValue(timeValue) || "00:00";
+  const parsed = new Date(`${normalizedDate}T${normalizedTime}`);
   const stamp = parsed.getTime();
-  return Number.isNaN(stamp) ? null : stamp;
+  if (Number.isFinite(stamp)) return stamp;
+
+  const fallback = new Date(`${normalizedDate} ${normalizedTime}`).getTime();
+  return Number.isFinite(fallback) ? fallback : null;
 }
 
 function getRequestDeadlineMs(request) {
@@ -145,13 +239,6 @@ export default function TeacherSchedulePage() {
   const [enrollments, setEnrollments] = useState([]);
   const [attendanceRecords, setAttendanceRecords] = useState([]);
   const [selectedSessionId, setSelectedSessionId] = useState(null);
-  const [formCourseId, setFormCourseId] = useState(courseCatalog[0]?.id ?? "");
-  const [formTitle, setFormTitle] = useState("");
-  const [formDate, setFormDate] = useState("");
-  const [formStartTime, setFormStartTime] = useState("");
-  const [formEndTime, setFormEndTime] = useState("");
-  const [formLocation, setFormLocation] = useState("");
-  const [formNotes, setFormNotes] = useState("");
   const [rescheduleRequests, setRescheduleRequests] = useState([]);
   const [resolutionDrafts, setResolutionDrafts] = useState({});
   const [processingRequestId, setProcessingRequestId] = useState(null);
@@ -162,6 +249,7 @@ export default function TeacherSchedulePage() {
   const [sessionRangeFilter, setSessionRangeFilter] = useState("all");
   const [sessionSearchKeyword, setSessionSearchKeyword] = useState("");
   const [expandedFixedCourseIds, setExpandedFixedCourseIds] = useState({});
+  const [resolvedVisibleCount, setResolvedVisibleCount] = useState(RESOLVED_REQUESTS_BATCH);
   const [expandedUpcomingGroups, setExpandedUpcomingGroups] = useState({
     today: true,
     thisWeek: true,
@@ -318,14 +406,18 @@ export default function TeacherSchedulePage() {
         }
         const newTime = (draft.newTime || request.requestedTime || "").trim();
 
-        await updateDoc(doc(db, "sessions", request.sessionId), {
-          date: newDate,
-          startTime: newTime,
-          updatedAt: serverTimestamp(),
-        });
+        if (request.sessionId) {
+          await updateDoc(doc(db, "sessions", request.sessionId), {
+            date: newDate,
+            startTime: newTime,
+            updatedAt: serverTimestamp(),
+          });
+        }
 
         await updateDoc(doc(db, "rescheduleRequests", request.id), {
           status: "approved",
+          approvedDate: newDate,
+          approvedTime: newTime,
           resolutionNote,
           resolvedAt: serverTimestamp(),
           resolvedBy: sessionUser.email ?? "instructor",
@@ -353,8 +445,8 @@ export default function TeacherSchedulePage() {
     }
   }
 
-  async function handleDeleteResolvedRequest(requestId) {
-    if (!confirm("Remove this resolved request from the list?")) {
+  async function handleDeleteRequest(requestId) {
+    if (!confirm("Remove this request from the list?")) {
       return;
     }
     try {
@@ -366,47 +458,101 @@ export default function TeacherSchedulePage() {
   }
 
   useEffect(() => {
-    if (!sessionUser?.uid) {
-        setRescheduleRequests([]);
-        return;
-      }
+    if (!sessionUser?.uid && !sessionUser?.email) {
+      setRescheduleRequests([]);
+      return;
+    }
 
-    const requestsQuery = query(
-      collection(db, "rescheduleRequests"),
-      where("teacherUid", "==", sessionUser.uid),
-      orderBy("createdAt", "desc")
-    );
-//实时更新更改情况
-    const unsubscribe = onSnapshot(
-      requestsQuery,
-      (snapshot) => {
-        const records = snapshot.docs.map((docSnapshot) => {
-          const data = docSnapshot.data();
-          const createdAt =
-            data.createdAt && typeof data.createdAt.toDate === "function"
-              ? data.createdAt.toDate().toISOString()
-              : data.createdAt ?? null;
-          const resolvedAt =
-            data.resolvedAt && typeof data.resolvedAt.toDate === "function"
-              ? data.resolvedAt.toDate().toISOString()
-              : data.resolvedAt ?? null;
-          return {
-            id: docSnapshot.id,
-            ...data,
-            createdAt,
-            resolvedAt,
-          };
-        });
-        setRescheduleRequests(records);
-      },
-      (error) => {
-        console.error("Failed to load reschedule requests", error);
-        setRescheduleRequests([]);
-      }
-    );
+    const uidRecords = new Map();
+    const emailRecords = new Map();
 
-    return () => unsubscribe();
-  }, [sessionUser?.uid]);
+    const normalizeRequestRecord = (docSnapshot) => {
+      const data = docSnapshot.data();
+      const createdAt =
+        data.createdAt && typeof data.createdAt.toDate === "function"
+          ? data.createdAt.toDate().toISOString()
+          : data.createdAt ?? null;
+      const resolvedAt =
+        data.resolvedAt && typeof data.resolvedAt.toDate === "function"
+          ? data.resolvedAt.toDate().toISOString()
+          : data.resolvedAt ?? null;
+      return {
+        id: docSnapshot.id,
+        ...data,
+        createdAt,
+        resolvedAt,
+      };
+    };
+
+    const syncMergedRecords = () => {
+      const merged = new Map();
+      uidRecords.forEach((value, key) => merged.set(key, value));
+      emailRecords.forEach((value, key) => merged.set(key, value));
+      const records = Array.from(merged.values()).sort((a, b) => {
+        const msA = toMillis(a?.createdAt);
+        const msB = toMillis(b?.createdAt);
+        if (Number.isFinite(msA) && Number.isFinite(msB)) return msB - msA;
+        if (Number.isFinite(msB)) return 1;
+        if (Number.isFinite(msA)) return -1;
+        return 0;
+      });
+      setRescheduleRequests(records);
+    };
+
+    const unsubscribes = [];
+
+    if (sessionUser?.uid) {
+      const uidQuery = query(
+        collection(db, "rescheduleRequests"),
+        where("teacherUid", "==", sessionUser.uid)
+      );
+      unsubscribes.push(
+        onSnapshot(
+          uidQuery,
+          (snapshot) => {
+            uidRecords.clear();
+            snapshot.docs.forEach((docSnapshot) => {
+              uidRecords.set(docSnapshot.id, normalizeRequestRecord(docSnapshot));
+            });
+            syncMergedRecords();
+          },
+          (error) => {
+            console.error("Failed to load reschedule requests (uid)", error);
+            uidRecords.clear();
+            syncMergedRecords();
+          }
+        )
+      );
+    }
+
+    if (sessionUser?.email) {
+      const emailQuery = query(
+        collection(db, "rescheduleRequests"),
+        where("teacherEmail", "==", sessionUser.email)
+      );
+      unsubscribes.push(
+        onSnapshot(
+          emailQuery,
+          (snapshot) => {
+            emailRecords.clear();
+            snapshot.docs.forEach((docSnapshot) => {
+              emailRecords.set(docSnapshot.id, normalizeRequestRecord(docSnapshot));
+            });
+            syncMergedRecords();
+          },
+          (error) => {
+            console.error("Failed to load reschedule requests (email)", error);
+            emailRecords.clear();
+            syncMergedRecords();
+          }
+        )
+      );
+    }
+
+    return () => {
+      unsubscribes.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [sessionUser?.uid, sessionUser?.email]);
 
 //sessions 按日期分成
   const sessionsByDate = useMemo(() => {
@@ -414,23 +560,34 @@ export default function TeacherSchedulePage() {
     const past = [];
     const today = new Date();
     today.setHours(0, 0, 0, 0);
+    const todayStamp = today.getTime();
 
     for (const session of sessions) {
       if (session.archived) continue;
-      const sessionDate = new Date(`${session.date}T${session.startTime || "00:00"}`);
-      if (sessionDate >= today) {
+      const sessionStamp = getSessionTimestamp(session);
+      if (!Number.isFinite(sessionStamp)) {
+        past.push(session);
+      } else if (sessionStamp >= todayStamp) {
         upcoming.push(session);
       } else {
         past.push(session);
       }
     }
 
-    upcoming.sort(
-      (a, b) => new Date(`${a.date}T${a.startTime || "00:00"}`) - new Date(`${b.date}T${b.startTime || "00:00"}`)
-    );
-    past.sort(
-      (a, b) => new Date(`${b.date}T${b.startTime || "00:00"}`) - new Date(`${a.date}T${a.startTime || "00:00"}`)
-    );
+    upcoming.sort((a, b) => {
+      const aStamp = getSessionTimestamp(a);
+      const bStamp = getSessionTimestamp(b);
+      const aValue = Number.isFinite(aStamp) ? aStamp : Number.MAX_SAFE_INTEGER;
+      const bValue = Number.isFinite(bStamp) ? bStamp : Number.MAX_SAFE_INTEGER;
+      return aValue - bValue;
+    });
+    past.sort((a, b) => {
+      const aStamp = getSessionTimestamp(a);
+      const bStamp = getSessionTimestamp(b);
+      const aValue = Number.isFinite(aStamp) ? aStamp : Number.MIN_SAFE_INTEGER;
+      const bValue = Number.isFinite(bStamp) ? bStamp : Number.MIN_SAFE_INTEGER;
+      return bValue - aValue;
+    });
     return { upcoming, past };
   }, [sessions]);
 
@@ -638,6 +795,16 @@ export default function TeacherSchedulePage() {
     () => filteredRequests.filter((request) => request.status !== "pending"),
     [filteredRequests]
   );
+  const visibleResolvedRequests = useMemo(
+    () => filteredResolvedRequests.slice(0, resolvedVisibleCount),
+    [filteredResolvedRequests, resolvedVisibleCount]
+  );
+  const hasMoreResolvedRequests = filteredResolvedRequests.length > resolvedVisibleCount;
+
+  useEffect(() => {
+    if (activeScheduleTab !== "requests") return;
+    setResolvedVisibleCount(RESOLVED_REQUESTS_BATCH);
+  }, [requestFilter, activeScheduleTab]);
 
   const paidEnrollments = useMemo(
     () => (enrollments || []).filter((enrollment) => hasPaidAccess(enrollment)),
@@ -678,6 +845,7 @@ export default function TeacherSchedulePage() {
           meetingLink: (enrollment.meetingLink || "").trim(),
           students: [],
           studentSet: new Set(),
+          activeFromMs: 0,
         });
       }
 
@@ -692,6 +860,10 @@ export default function TeacherSchedulePage() {
       }
       if (!slot.meetingLink && enrollment.meetingLink) {
         slot.meetingLink = enrollment.meetingLink.trim();
+      }
+      const activeFromMs = getEnrollmentActiveFromMs(enrollment);
+      if (activeFromMs > slot.activeFromMs) {
+        slot.activeFromMs = activeFromMs;
       }
     }
 
@@ -710,8 +882,9 @@ export default function TeacherSchedulePage() {
   const summaryCounts = useMemo(() => {
     const upcomingCount = sessionsByDate.upcoming.length;
     const thisWeekCount = sessionsByDate.upcoming.filter((s) => {
-      const diffDays =
-        (new Date(`${s.date}T${s.startTime || "00:00"}`) - new Date()) / (1000 * 60 * 60 * 24);
+      const sessionStamp = getSessionTimestamp(s);
+      if (!Number.isFinite(sessionStamp)) return false;
+      const diffDays = (sessionStamp - Date.now()) / (1000 * 60 * 60 * 24);
       return diffDays >= 0 && diffDays <= 7;
     }).length;
     const requestCounts = {
@@ -729,8 +902,8 @@ export default function TeacherSchedulePage() {
     for (const session of sessions || []) {
       if (session?.archived) continue;
       if (!session?.courseId || !session?.date) continue;
-      const stamp = new Date(`${session.date}T${session.startTime || "00:00"}`).getTime();
-      if (Number.isNaN(stamp) || stamp < cutoff) continue;
+      const stamp = getSessionTimestamp(session);
+      if (!Number.isFinite(stamp) || stamp < cutoff) continue;
 
       const existing = map.get(session.courseId);
       if (!existing || stamp < existing.stamp) {
@@ -747,14 +920,37 @@ export default function TeacherSchedulePage() {
 
   const fixedWeeklyCourseGroups = useMemo(() => {
     const groups = new Map();
+    const nowCutoff = Date.now() - 60 * 60 * 1000;
 
     for (const slot of fixedWeeklySlots) {
+      const slotWeekdays = parseWeekdayIndexes(slot.dayLabel);
+      const slotStartTime = String(slot.startTime || "").trim();
+      const slotActiveFromMs = Number.isFinite(slot.activeFromMs) ? slot.activeFromMs : 0;
+      const eligibleSessions = (sessions || []).filter((session) => {
+        if (session.archived) return false;
+        if ((session.courseId || "") !== slot.courseId) return false;
+        const sessionStamp = getSessionTimestamp(session);
+        if (!Number.isFinite(sessionStamp)) return false;
+        if (slotActiveFromMs && sessionStamp < slotActiveFromMs - 60 * 1000) return false;
+        return true;
+      });
       const nextOccurrence = getNextSlotOccurrence(slot.dayLabel, slot.startTime);
-      const scheduledSession = nearestUpcomingSessionByCourse.get(slot.courseId) || null;
+      const scheduledSession = eligibleSessions.reduce((best, session) => {
+        const sessionStamp = getSessionTimestamp(session);
+        if (!Number.isFinite(sessionStamp) || sessionStamp < nowCutoff) return best;
+        const sessionStart = String(session.startTime || "").trim();
+        if (slotStartTime && sessionStart && sessionStart !== slotStartTime) return best;
+        if (slotWeekdays.length) {
+          const sessionDay = Number.isFinite(sessionStamp) ? new Date(sessionStamp).getDay() : null;
+          if (!slotWeekdays.includes(sessionDay)) return best;
+        }
+        if (!best) return session;
+        const bestStamp = getSessionTimestamp(best);
+        if (!Number.isFinite(bestStamp) || sessionStamp < bestStamp) return session;
+        return best;
+      }, null);
       const matchingSession = nextOccurrence
-        ? sessions.find((session) => {
-            if (session.archived) return false;
-            if ((session.courseId || "") !== slot.courseId) return false;
+        ? eligibleSessions.find((session) => {
             if ((session.date || "") !== nextOccurrence.dateKey) return false;
             if (!slot.startTime) return true;
             return (session.startTime || "") === slot.startTime;
@@ -762,14 +958,16 @@ export default function TeacherSchedulePage() {
         : null;
       const usingScheduledSession =
         !!scheduledSession && (!matchingSession || scheduledSession.id !== matchingSession.id);
+      const scheduledStamp = getSessionTimestamp(scheduledSession);
+      const nextOccurrenceStamp = nextOccurrence?.dateTime?.getTime();
       const nextStamp =
-        nextOccurrence?.dateTime?.getTime() ??
-        getSessionTimestamp(scheduledSession) ??
+        (Number.isFinite(scheduledStamp) ? scheduledStamp : NaN) ||
+        (Number.isFinite(nextOccurrenceStamp) ? nextOccurrenceStamp : NaN) ||
         Number.MAX_SAFE_INTEGER;
-      const nextLabel = nextOccurrence
-        ? nextOccurrence.dateTime.toLocaleString()
-        : scheduledSession
+      const nextLabel = scheduledSession
         ? formatSessionDateTime(scheduledSession)
+        : nextOccurrence
+        ? nextOccurrence.dateTime.toLocaleString()
         : "Date TBD";
 
       const slotItem = {
@@ -822,7 +1020,7 @@ export default function TeacherSchedulePage() {
         if (a.earliestStamp !== b.earliestStamp) return a.earliestStamp - b.earliestStamp;
         return (a.courseTitle || "").localeCompare(b.courseTitle || "");
       });
-  }, [fixedWeeklySlots, nearestUpcomingSessionByCourse, sessions]);
+  }, [fixedWeeklySlots, sessions]);
 
   useEffect(() => {
     if (!fixedWeeklyCourseGroups.length) {
@@ -850,12 +1048,85 @@ export default function TeacherSchedulePage() {
   const studentsForSelectedSession = useMemo(() => {
     if (!selectedSession?.courseId) return [];
 
-    const grouped = new Map();
+    const selectedSessionDate = normalizeDateValue(selectedSession.date);
+    const selectedSessionStartTime =
+      normalizeTimeValue(selectedSession.startTime) || String(selectedSession.startTime || "").trim();
+    const selectedSessionStamp = getSessionTimestamp(selectedSession);
+    const selectedSessionDay = Number.isFinite(selectedSessionStamp)
+      ? new Date(selectedSessionStamp).getDay()
+      : null;
+
+    const approvedStudentKeys = new Set();
+    for (const request of rescheduleRequests || []) {
+      const status = String(request?.status || "").toLowerCase();
+      if (status !== "approved") continue;
+      if ((request.courseId || "") !== selectedSession.courseId) continue;
+
+      const requestDate = normalizeDateValue(request.approvedDate || request.requestedDate);
+      const requestTime =
+        normalizeTimeValue(request.approvedTime || request.requestedTime) ||
+        String(request.approvedTime || request.requestedTime || "").trim();
+      const hasSessionBinding = Boolean(request.sessionId);
+      const sameSessionId = hasSessionBinding && request.sessionId === selectedSession.id;
+      const sameDate = Boolean(requestDate && requestDate === selectedSessionDate);
+      const sameTimeOrFlexible =
+        !requestTime || !selectedSessionStartTime || requestTime === selectedSessionStartTime;
+      const requestMatchesSession =
+        sameSessionId ||
+        (sameDate && (sameTimeOrFlexible || !hasSessionBinding));
+
+      if (!requestMatchesSession) continue;
+      const requestStudentUid = String(request.studentUid || "").trim();
+      const requestStudentEmail = String(request.studentEmail || "").trim();
+      if (requestStudentUid) approvedStudentKeys.add(requestStudentUid);
+      if (requestStudentEmail) approvedStudentKeys.add(requestStudentEmail);
+    }
+
+    const latestEnrollmentByStudent = new Map();
     for (const enrollment of paidEnrollments) {
       if ((enrollment.courseId || "") !== selectedSession.courseId) continue;
       const identifier = enrollment.studentUid || enrollment.studentEmail || enrollment.docId || "";
-      if (!identifier || grouped.has(identifier)) continue;
-      grouped.set(identifier, {
+      if (!identifier || latestEnrollmentByStudent.has(identifier)) continue;
+      latestEnrollmentByStudent.set(identifier, enrollment);
+    }
+
+    const grouped = new Map();
+    for (const [studentKey, enrollment] of latestEnrollmentByStudent.entries()) {
+      if (!studentKey || grouped.has(studentKey)) continue;
+
+      const enrollmentStudentKeys = [
+        String(enrollment.studentUid || "").trim(),
+        String(enrollment.studentEmail || "").trim(),
+      ].filter(Boolean);
+      const isApprovedRescheduleStudent = enrollmentStudentKeys.some((key) =>
+        approvedStudentKeys.has(key)
+      );
+
+      if (!isApprovedRescheduleStudent) {
+        const enrollmentActiveFromMs = getEnrollmentActiveFromMs(enrollment);
+        if (
+          Number.isFinite(selectedSessionStamp) &&
+          enrollmentActiveFromMs &&
+          selectedSessionStamp < enrollmentActiveFromMs - 60 * 1000
+        ) {
+          continue;
+        }
+
+        const enrollmentStartTime =
+          normalizeTimeValue(enrollment.timeSlotStartTime) ||
+          normalizeTimeValue((String(enrollment.timeSlotLabel || "").match(/(\d{1,2}:\d{2})/) || [])[1]) ||
+          String(enrollment.timeSlotStartTime || "").trim();
+        if (enrollmentStartTime && selectedSessionStartTime && enrollmentStartTime !== selectedSessionStartTime) {
+          continue;
+        }
+
+        const enrollmentDays = getEnrollmentWeekdayIndexes(enrollment);
+        if (enrollmentDays.length && Number.isInteger(selectedSessionDay) && !enrollmentDays.includes(selectedSessionDay)) {
+          continue;
+        }
+      }
+
+      grouped.set(studentKey, {
         studentEmail: enrollment.studentEmail || "",
         studentName: enrollment.studentName || enrollment.studentEmail || "Student",
         studentUid: enrollment.studentUid || "",
@@ -864,45 +1135,7 @@ export default function TeacherSchedulePage() {
 
     return Array.from(grouped.values())
       .sort((a, b) => (a.studentName || "").localeCompare(b.studentName || ""));
-  }, [paidEnrollments, selectedSession?.courseId]);
-
-  function handleCreateSession(event) {
-    event.preventDefault();
-    if (!formCourseId || !formDate) {
-      alert("Please select a course and date for the session.");
-      return;
-    }
-
-    const course = courseCatalog.find((item) => item.id === formCourseId);
-
-    addDoc(collection(db, "sessions"), {
-      courseId: formCourseId,
-      courseTitle: course?.title || "",
-      courseLevel: course?.level || "",
-      title: formTitle.trim() || `${course?.title || "Lesson"} Session`,
-      date: formDate,
-      startTime: formStartTime,
-      endTime: formEndTime,
-      location: formLocation.trim(),
-      notes: formNotes.trim(),
-      teacherUid: sessionUser.uid,
-      teacherEmail: sessionUser.email || "",
-      createdAt: serverTimestamp(),
-    })
-      .then((docRef) => {
-        setSelectedSessionId(docRef.id);
-        setFormTitle("");
-        setFormDate("");
-        setFormStartTime("");
-        setFormEndTime("");
-        setFormLocation("");
-        setFormNotes("");
-      })
-      .catch((error) => {
-        console.error("Failed to create session", error);
-        alert("Unable to create session. Please try again.");
-      });
-  }
+  }, [paidEnrollments, rescheduleRequests, selectedSession]);
 
   async function handleDeleteSession(sessionId) {
     if (!confirm("Remove this session from schedule?")) {
@@ -1009,7 +1242,9 @@ export default function TeacherSchedulePage() {
               Course: {request.courseTitle || request.courseId}
             </p>
             <p style={{ fontSize: "12px", color: "#64748b" }}>
-              Original session: {request.sessionDate} {request.sessionStartTime}
+              Original session: {request.sessionDate || request.sessionStartTime
+                ? `${request.sessionDate || ""} ${request.sessionStartTime || ""}`.trim()
+                : "Not assigned yet (first-lesson request)"}
             </p>
             {request.requestedDate && (
               <p style={{ fontSize: "12px", color: "#64748b" }}>
@@ -1161,6 +1396,22 @@ export default function TeacherSchedulePage() {
               >
                 Decline
               </button>
+              <button
+                type="button"
+                onClick={() => handleDeleteRequest(request.id)}
+                disabled={isProcessing}
+                style={{
+                  padding: "8px 16px",
+                  borderRadius: "10px",
+                  border: "1px solid rgba(148,163,184,0.45)",
+                  backgroundColor: "white",
+                  color: "#334155",
+                  fontWeight: 600,
+                  cursor: isProcessing ? "not-allowed" : "pointer",
+                }}
+              >
+                Delete
+              </button>
             </div>
           </form>
         ) : (
@@ -1173,7 +1424,7 @@ export default function TeacherSchedulePage() {
         {!isPending && (
           <button
             type="button"
-            onClick={() => handleDeleteResolvedRequest(request.id)}
+            onClick={() => handleDeleteRequest(request.id)}
             style={{
               padding: "6px 12px",
               borderRadius: "999px",
@@ -1198,7 +1449,7 @@ export default function TeacherSchedulePage() {
 
     setCreatingFixedSessionKey(slot.key);
     try {
-      const scheduledSession = nearestUpcomingSessionByCourse.get(slot.courseId);
+      const scheduledSession = slot?.scheduledSession || null;
       if (scheduledSession) {
         openAttendanceSession(scheduledSession.id);
         return;
@@ -1406,250 +1657,6 @@ export default function TeacherSchedulePage() {
         >
           {/* 左列 */}
           <div style={{ display: "grid", gap: "18px" }}>
-            {activeScheduleTab === "calendar" && (
-            <>
-            {/* 创建会话表单 */}
-            <section
-              id="create-session"
-              style={{
-                borderRadius: "20px",
-                border: "1px solid rgba(203,213,225,0.75)",
-                padding: "24px",
-                backgroundColor: "#fbfdff",
-                display: "grid",
-                gap: "14px",
-              }}
-            >
-              <div>
-                <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
-                  PUBLISH LESSON
-                </p>
-                <h2 style={{ margin: "6px 0 0", fontSize: "22px", fontWeight: 700, color: "#0f172a" }}>
-                  Create a lesson session
-                </h2>
-              </div>
-             <form
-                    onSubmit={handleCreateSession}
-                    style={{
-                    display: "grid",
-                    gap: "14px",
-                    gridTemplateColumns: "repeat(auto-fit, minmax(250px, 1fr))",
-                  }}
-                >
-                  <label
-                    style={{
-                      display: "grid",
-                      gap: "6px",
-                      fontSize: "13px",
-                      fontWeight: 600,
-                      color: "#0f172a",
-                    }}
-                  >
-                    Course
-                    <select
-                      value={formCourseId}
-                      onChange={(event) => setFormCourseId(event.target.value)}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        border: "1px solid #cbd5f5",
-                        backgroundColor: "white",
-                        color: "#0f172a",
-                        colorScheme: "light",
-                        fontSize: "14px",
-                      }}
-                    >
-                      {courseCatalog.map((course) => (
-                        <option key={course.id} value={course.id}>
-                          {course.title}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <label
-                    style={{
-                      display: "grid",
-                      gap: "6px",
-                      fontSize: "13px",
-                      fontWeight: 600,
-                      color: "#0f172a",
-                    }}
-                  >
-                    Session title
-                    <input
-                      type="text"
-                      value={formTitle}
-                      onChange={(event) => setFormTitle(event.target.value)}
-                      placeholder="e.g. Technique workshop"
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        border: "1px solid #cbd5f5",
-                        backgroundColor: "white",
-                        color: "#0f172a",
-                        colorScheme: "light",
-                        fontSize: "14px",
-                      }}
-                    />
-                  </label>
-
-                  <label
-                    style={{
-                      display: "grid",
-                      gap: "6px",
-                      fontSize: "13px",
-                      fontWeight: 600,
-                      color: "#0f172a",
-                    }}
-                  >
-                    Date
-                    <input
-                      type="date"
-                      value={formDate}
-                      onChange={(event) => setFormDate(event.target.value)}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        border: "1px solid #cbd5f5",
-                        backgroundColor: "white",
-                        color: "#0f172a",
-                        colorScheme: "light",
-                        fontSize: "14px",
-                      }}
-                    />
-                  </label>
-
-                  <label
-                    style={{
-                      display: "grid",
-                      gap: "6px",
-                      fontSize: "13px",
-                      fontWeight: 600,
-                      color: "#0f172a",
-                    }}
-                  >
-                    Start time
-                    <input
-                      type="time"
-                      value={formStartTime}
-                      onChange={(event) => setFormStartTime(event.target.value)}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        border: "1px solid #cbd5f5",
-                        backgroundColor: "white",
-                        color: "#0f172a",
-                        colorScheme: "light",
-                        fontSize: "14px",
-                      }}
-                    />
-                  </label>
-
-                  <label
-                    style={{
-                      display: "grid",
-                      gap: "6px",
-                      fontSize: "13px",
-                      fontWeight: 600,
-                      color: "#0f172a",
-                    }}
-                  >
-                    End time
-                    <input
-                      type="time"
-                      value={formEndTime}
-                      onChange={(event) => setFormEndTime(event.target.value)}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        border: "1px solid #cbd5f5",
-                        backgroundColor: "white",
-                        color: "#0f172a",
-                        colorScheme: "light",
-                        fontSize: "14px",
-                      }}
-                    />
-                  </label>
-
-                  <label
-                    style={{
-                      display: "grid",
-                      gap: "6px",
-                      fontSize: "13px",
-                      fontWeight: 600,
-                      color: "#0f172a",
-                    }}
-                  >
-                    Location / room
-                    <input
-                      type="text"
-                      value={formLocation}
-                      onChange={(event) => setFormLocation(event.target.value)}
-                      placeholder="Studio A, Zoom, etc."
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        border: "1px solid #cbd5f5",
-                        backgroundColor: "white",
-                        color: "#0f172a",
-                        colorScheme: "light",
-                        fontSize: "14px",
-                      }}
-                    />
-                  </label>
-
-                  <label
-                    style={{
-                      gridColumn: "1 / -1",
-                      display: "grid",
-                      gap: "6px",
-                      fontSize: "13px",
-                      fontWeight: 600,
-                      color: "#0f172a",
-                    }}
-                  >
-                    Notes for students
-                    <textarea
-                      value={formNotes}
-                      onChange={(event) => setFormNotes(event.target.value)}
-                      placeholder="Share focus pieces, reminders, or preparation tips."
-                      rows={3}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: "10px",
-                        border: "1px solid #cbd5f5",
-                        backgroundColor: "white",
-                        color: "#0f172a",
-                        colorScheme: "light",
-                        fontSize: "14px",
-                        resize: "vertical",
-                      }}
-                            />
-                          </label>
-
-          <div style={{ gridColumn: "1 / -1" }}>
-            <button
-              type="submit"
-              style={{
-                padding: "12px 20px",
-                borderRadius: "10px",
-                border: "none",
-                background: "linear-gradient(120deg, #2563eb, #1d4ed8)",
-                color: "white",
-                fontWeight: 600,
-                cursor: "pointer",
-                boxShadow: "0 18px 35px rgba(37, 99, 235, 0.30)",
-              }}
-            >
-              Create session
-          </button>
-        </div>
-      </form>
-            </section>
-            </>
-            )}
-
             {activeScheduleTab === "calendar" && fixedWeeklyCourseGroups.length > 0 && (
               <section
                 id="fixed-slots"
@@ -1878,51 +1885,209 @@ export default function TeacherSchedulePage() {
 
             {activeScheduleTab === "requests" && (
               <section
+                id="reschedule-requests"
                 style={{
                   borderRadius: "20px",
                   border: "1px solid rgba(203,213,225,0.75)",
-                  padding: "20px",
-                  backgroundColor: "#fbfdff",
+                  padding: "18px",
+                  backgroundColor: "#f8fbff",
                   display: "grid",
-                  gap: "8px",
+                  gap: "12px",
                 }}
               >
-                <h2 style={{ margin: 0, fontSize: "20px", fontWeight: 700, color: "#0f172a" }}>
-                  Request operations
-                </h2>
-                <p style={{ margin: 0, fontSize: "13px", color: "#475569" }}>
-                  Use the right panel to approve or decline requests. Priority should go to pending requests.
-                </p>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: "8px" }}>
-                  <span
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      padding: "5px 10px",
-                      borderRadius: "999px",
-                      fontSize: "12px",
-                      fontWeight: 700,
-                      color: "#7c3aed",
-                      backgroundColor: "rgba(233,213,255,0.7)",
-                    }}
-                  >
-                    Pending: {pendingRequests.length}
-                  </span>
-                  <span
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      padding: "5px 10px",
-                      borderRadius: "999px",
-                      fontSize: "12px",
-                      fontWeight: 700,
-                      color: "#0369a1",
-                      backgroundColor: "rgba(224,242,254,0.8)",
-                    }}
-                  >
-                    Total: {rescheduleRequests.length}
-                  </span>
+                <header
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: "10px",
+                  }}
+                >
+                  <div>
+                    <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
+                      REQUEST INBOX
+                    </p>
+                    <h2 style={{ fontSize: "22px", fontWeight: 700, color: "#0f172a", marginTop: "4px" }}>Reschedule requests</h2>
+                    <p style={{ fontSize: "13px", color: "#475569", marginTop: "4px" }}>
+                      Review make-up lesson requests submitted by students.
+                    </p>
+                  </div>
+                </header>
+
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                  {[
+                    { key: "pending", label: `Pending (${pendingRequests.length})` },
+                    { key: "all", label: `All (${rescheduleRequests.length})` },
+                    { key: "resolved", label: `Resolved (${resolvedRequests.length})` },
+                  ].map((option) => (
+                    <button
+                      key={option.key}
+                      type="button"
+                      onClick={() => setRequestFilter(option.key)}
+                      style={{
+                        padding: "6px 11px",
+                        borderRadius: "999px",
+                        border:
+                          requestFilter === option.key
+                            ? "1px solid rgba(37,99,235,0.5)"
+                            : "1px solid rgba(148,163,184,0.4)",
+                        backgroundColor: requestFilter === option.key ? "rgba(219,234,254,0.95)" : "white",
+                        color: requestFilter === option.key ? "#1d4ed8" : "#475569",
+                        fontSize: "12px",
+                        fontWeight: 600,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
                 </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
+                  {[
+                    {
+                      label: "Overdue",
+                      value: pendingQueueCounts.overdue,
+                      color: "#b91c1c",
+                      bg: "rgba(254,226,226,0.9)",
+                    },
+                    {
+                      label: "Urgent",
+                      value: pendingQueueCounts.urgent,
+                      color: "#c2410c",
+                      bg: "rgba(255,237,213,0.9)",
+                    },
+                    {
+                      label: "This week",
+                      value: pendingQueueCounts.thisWeek,
+                      color: "#1d4ed8",
+                      bg: "rgba(219,234,254,0.9)",
+                    },
+                    {
+                      label: "Later",
+                      value: pendingQueueCounts.later,
+                      color: "#334155",
+                      bg: "rgba(226,232,240,0.85)",
+                    },
+                  ].map((item) => (
+                  <div
+                    key={item.label}
+                    style={{
+                      borderRadius: "10px",
+                      padding: "8px 10px",
+                      backgroundColor: item.bg,
+                      display: "grid",
+                      gap: "2px",
+                    }}
+                  >
+                    <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, color: item.color }}>{item.label}</p>
+                    <p style={{ margin: 0, fontSize: "20px", fontWeight: 800, color: "#0f172a" }}>{item.value}</p>
+                  </div>
+                ))}
+                </div>
+
+                {!filteredRequests.length ? (
+                  <p style={{ fontSize: "13px", color: "#475569" }}>
+                    {requestFilter === "pending"
+                      ? "No pending requests at the moment."
+                      : requestFilter === "resolved"
+                      ? "No resolved requests yet."
+                      : "No requests found."}
+                  </p>
+                ) : (
+                  <div style={{ display: "grid", gap: "12px", maxHeight: "900px", overflowY: "auto", paddingRight: "2px" }}>
+                    {filteredPendingRequestGroups
+                      .filter((group) => group.items.length > 0)
+                      .map((group) => (
+                        <section key={group.key} style={{ display: "grid", gap: "10px" }}>
+                          <div
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              padding: "5px 10px",
+                              borderRadius: "999px",
+                              fontSize: "12px",
+                              fontWeight: 700,
+                              color: group.badgeColor,
+                              backgroundColor: group.badgeBg,
+                              justifySelf: "start",
+                            }}
+                          >
+                            {group.label} ({group.items.length})
+                          </div>
+                          <div style={{ display: "grid", gap: "10px" }}>
+                            {group.items.map((request) => renderRequestCard(request, { tone: group }))}
+                          </div>
+                        </section>
+                      ))}
+
+                    {filteredResolvedRequests.length > 0 && (
+                      <section style={{ display: "grid", gap: "10px" }}>
+                        <div
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            padding: "5px 10px",
+                            borderRadius: "999px",
+                            fontSize: "12px",
+                            fontWeight: 700,
+                            color: "#475569",
+                            backgroundColor: "rgba(226,232,240,0.85)",
+                            justifySelf: "start",
+                          }}
+                        >
+                          Resolved ({filteredResolvedRequests.length})
+                        </div>
+                        <div style={{ display: "grid", gap: "10px" }}>
+                          {visibleResolvedRequests.map((request) => renderRequestCard(request))}
+                        </div>
+                        {(hasMoreResolvedRequests || resolvedVisibleCount > RESOLVED_REQUESTS_BATCH) && (
+                          <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                            {hasMoreResolvedRequests && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setResolvedVisibleCount((previous) => previous + RESOLVED_REQUESTS_BATCH)
+                                }
+                                style={{
+                                  padding: "7px 12px",
+                                  borderRadius: "999px",
+                                  border: "1px solid rgba(37,99,235,0.35)",
+                                  backgroundColor: "rgba(219,234,254,0.85)",
+                                  color: "#1d4ed8",
+                                  fontSize: "12px",
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                Load more resolved ({filteredResolvedRequests.length - visibleResolvedRequests.length} left)
+                              </button>
+                            )}
+                            {resolvedVisibleCount > RESOLVED_REQUESTS_BATCH && (
+                              <button
+                                type="button"
+                                onClick={() => setResolvedVisibleCount(RESOLVED_REQUESTS_BATCH)}
+                                style={{
+                                  padding: "7px 12px",
+                                  borderRadius: "999px",
+                                  border: "1px solid rgba(148,163,184,0.4)",
+                                  backgroundColor: "white",
+                                  color: "#334155",
+                                  fontSize: "12px",
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                }}
+                              >
+                                Show latest {RESOLVED_REQUESTS_BATCH}
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </section>
+                    )}
+                  </div>
+                )}
               </section>
             )}
             {/* 即将到来 / 历史会话列表 */}
@@ -2465,172 +2630,6 @@ export default function TeacherSchedulePage() {
               </div>
             </div>
 
-            {/* Reschedule requests */}
-            {activeScheduleTab === "requests" && (
-            <section
-              id="reschedule-requests"
-              style={{
-                borderRadius: "20px",
-                border: "1px solid rgba(191,219,254,0.75)",
-                padding: "18px",
-                backgroundColor: "#f8fbff",
-                display: "grid",
-                gap: "12px",
-              }}
-            >
-              <header
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                  gap: "10px",
-                }}
-              >
-                <div>
-                  <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, letterSpacing: "0.12em", color: "#0ea5a4" }}>
-                    REQUEST INBOX
-                  </p>
-                  <h2 style={{ fontSize: "22px", fontWeight: 700, color: "#0f172a", marginTop: "4px" }}>Reschedule requests</h2>
-                  <p style={{ fontSize: "13px", color: "#475569", marginTop: "4px" }}>
-                    Review make-up lesson requests submitted by students.
-                  </p>
-                </div>
-              </header>
-
-              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
-                {[
-                  { key: "pending", label: `Pending (${pendingRequests.length})` },
-                  { key: "all", label: `All (${rescheduleRequests.length})` },
-                  { key: "resolved", label: `Resolved (${resolvedRequests.length})` },
-                ].map((option) => (
-                  <button
-                    key={option.key}
-                    type="button"
-                    onClick={() => setRequestFilter(option.key)}
-                    style={{
-                      padding: "6px 11px",
-                      borderRadius: "999px",
-                      border:
-                        requestFilter === option.key
-                          ? "1px solid rgba(37,99,235,0.5)"
-                          : "1px solid rgba(148,163,184,0.4)",
-                      backgroundColor: requestFilter === option.key ? "rgba(219,234,254,0.95)" : "white",
-                      color: requestFilter === option.key ? "#1d4ed8" : "#475569",
-                      fontSize: "12px",
-                      fontWeight: 600,
-                      cursor: "pointer",
-                    }}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: "8px" }}>
-                {[
-                  {
-                    label: "Overdue",
-                    value: pendingQueueCounts.overdue,
-                    color: "#b91c1c",
-                    bg: "rgba(254,226,226,0.9)",
-                  },
-                  {
-                    label: "Urgent",
-                    value: pendingQueueCounts.urgent,
-                    color: "#c2410c",
-                    bg: "rgba(255,237,213,0.9)",
-                  },
-                  {
-                    label: "This week",
-                    value: pendingQueueCounts.thisWeek,
-                    color: "#1d4ed8",
-                    bg: "rgba(219,234,254,0.9)",
-                  },
-                  {
-                    label: "Later",
-                    value: pendingQueueCounts.later,
-                    color: "#334155",
-                    bg: "rgba(226,232,240,0.85)",
-                  },
-                ].map((item) => (
-                  <div
-                    key={item.label}
-                    style={{
-                      borderRadius: "10px",
-                      padding: "8px 10px",
-                      backgroundColor: item.bg,
-                      display: "grid",
-                      gap: "2px",
-                    }}
-                  >
-                    <p style={{ margin: 0, fontSize: "11px", fontWeight: 700, color: item.color }}>{item.label}</p>
-                    <p style={{ margin: 0, fontSize: "20px", fontWeight: 800, color: "#0f172a" }}>{item.value}</p>
-                  </div>
-                ))}
-              </div>
-
-              {!filteredRequests.length ? (
-                <p style={{ fontSize: "13px", color: "#475569" }}>
-                  {requestFilter === "pending"
-                    ? "No pending requests at the moment."
-                    : requestFilter === "resolved"
-                    ? "No resolved requests yet."
-                    : "No requests found."}
-                </p>
-              ) : (
-                <div style={{ display: "grid", gap: "12px", maxHeight: "900px", overflowY: "auto", paddingRight: "2px" }}>
-                  {filteredPendingRequestGroups
-                    .filter((group) => group.items.length > 0)
-                    .map((group) => (
-                      <section key={group.key} style={{ display: "grid", gap: "10px" }}>
-                        <div
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            padding: "5px 10px",
-                            borderRadius: "999px",
-                            fontSize: "12px",
-                            fontWeight: 700,
-                            color: group.badgeColor,
-                            backgroundColor: group.badgeBg,
-                            justifySelf: "start",
-                          }}
-                        >
-                          {group.label} ({group.items.length})
-                        </div>
-                        <div style={{ display: "grid", gap: "10px" }}>
-                          {group.items.map((request) => renderRequestCard(request, { tone: group }))}
-                        </div>
-                      </section>
-                    ))}
-
-                  {filteredResolvedRequests.length > 0 && (
-                    <section style={{ display: "grid", gap: "10px" }}>
-                      <div
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          padding: "5px 10px",
-                          borderRadius: "999px",
-                          fontSize: "12px",
-                          fontWeight: 700,
-                          color: "#475569",
-                          backgroundColor: "rgba(226,232,240,0.85)",
-                          justifySelf: "start",
-                        }}
-                      >
-                        Resolved ({filteredResolvedRequests.length})
-                      </div>
-                      <div style={{ display: "grid", gap: "10px" }}>
-                        {filteredResolvedRequests.map((request) => renderRequestCard(request))}
-                      </div>
-                    </section>
-                  )}
-                </div>
-              )}
-            </section>
-            )}
           </aside>
         </div>
       </section>
@@ -2664,7 +2663,7 @@ function SessionCard({ session, course, onManage, onDelete }) {
           </h3>
           <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>
             {course?.title ? `${course.title}  ` : ""}
-            {new Date(`${session.date}T${session.startTime || "00:00"}`).toLocaleString()}
+            {formatSessionDateTime(session)}
             {session.location ? `  ${session.location}` : ""}
           </p>
         </div>

@@ -5,7 +5,7 @@ import Image from "next/image";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { signOut } from "firebase/auth";
-import {addDoc,collection,collectionGroup,onSnapshot,orderBy,query,serverTimestamp,where,} from "firebase/firestore";
+import {addDoc,collection,collectionGroup,doc,onSnapshot,orderBy,query,serverTimestamp,updateDoc,where,} from "firebase/firestore";
 import { auth, db } from "@/lib/firebase";
 import { useSessionUser } from "@/hooks/useSessionUser";
 import { courseCatalog } from "@/lib/courseCatalog";
@@ -280,50 +280,103 @@ export default function DashboardPage() {
     };
   }, [sessionUser, currentUid]);
 
-  
   useEffect(() => {
-    if (!sessionUser?.uid) {
+    if (!sessionUser?.uid && !sessionUser?.email) {
       setRescheduleRequests([]);
       return;
     }
 
-    const requestsQuery = query(
-      collection(db, "rescheduleRequests"),
-      where("studentUid", "==", sessionUser.uid),
-      orderBy("createdAt", "desc")
-    );
+    const uidRecords = new Map();
+    const emailRecords = new Map();
 
-    const unsubscribe = onSnapshot(
-      requestsQuery,
-      (snapshot) => {
-        const records = snapshot.docs.map((docSnapshot) => {
-          const data = docSnapshot.data();
-          const createdAt =
-            data.createdAt && typeof data.createdAt.toDate === "function"
-              ? data.createdAt.toDate().toISOString()
-              : data.createdAt ?? null;
-          const resolvedAt =
-            data.resolvedAt && typeof data.resolvedAt.toDate === "function"
-              ? data.resolvedAt.toDate().toISOString()
-              : data.resolvedAt ?? null;
+    const normalizeRequestRecord = (docSnapshot) => {
+      const data = docSnapshot.data();
+      const createdAt =
+        data.createdAt && typeof data.createdAt.toDate === "function"
+          ? data.createdAt.toDate().toISOString()
+          : data.createdAt ?? null;
+      const resolvedAt =
+        data.resolvedAt && typeof data.resolvedAt.toDate === "function"
+          ? data.resolvedAt.toDate().toISOString()
+          : data.resolvedAt ?? null;
 
-          return {
-            id: docSnapshot.id,
-            ...data,
-            createdAt,
-            resolvedAt,
-          };
-        });
-        setRescheduleRequests(records);
-      },
-      (error) => {
-        console.error("Failed to load reschedule requests", error);
-        setRescheduleRequests([]);
-      }
-    );
+      return {
+        id: docSnapshot.id,
+        ...data,
+        createdAt,
+        resolvedAt,
+      };
+    };
 
-    return () => unsubscribe();
-  }, [sessionUser?.uid]);
+    const syncMergedRecords = () => {
+      const merged = new Map();
+      uidRecords.forEach((value, key) => merged.set(key, value));
+      emailRecords.forEach((value, key) => merged.set(key, value));
+      const records = Array.from(merged.values()).sort((a, b) => {
+        const msA = toMillis(a?.createdAt);
+        const msB = toMillis(b?.createdAt);
+        if (Number.isFinite(msA) && Number.isFinite(msB)) return msB - msA;
+        if (Number.isFinite(msB)) return 1;
+        if (Number.isFinite(msA)) return -1;
+        return 0;
+      });
+      setRescheduleRequests(records);
+    };
+
+    const unsubscribes = [];
+
+    if (sessionUser?.uid) {
+      const uidQuery = query(
+        collection(db, "rescheduleRequests"),
+        where("studentUid", "==", sessionUser.uid)
+      );
+      unsubscribes.push(
+        onSnapshot(
+          uidQuery,
+          (snapshot) => {
+            uidRecords.clear();
+            snapshot.docs.forEach((docSnapshot) => {
+              uidRecords.set(docSnapshot.id, normalizeRequestRecord(docSnapshot));
+            });
+            syncMergedRecords();
+          },
+          (error) => {
+            console.error("Failed to load reschedule requests (uid)", error);
+            uidRecords.clear();
+            syncMergedRecords();
+          }
+        )
+      );
+    }
+
+    if (sessionUser?.email) {
+      const emailQuery = query(
+        collection(db, "rescheduleRequests"),
+        where("studentEmail", "==", sessionUser.email)
+      );
+      unsubscribes.push(
+        onSnapshot(
+          emailQuery,
+          (snapshot) => {
+            emailRecords.clear();
+            snapshot.docs.forEach((docSnapshot) => {
+              emailRecords.set(docSnapshot.id, normalizeRequestRecord(docSnapshot));
+            });
+            syncMergedRecords();
+          },
+          (error) => {
+            console.error("Failed to load reschedule requests (email)", error);
+            emailRecords.clear();
+            syncMergedRecords();
+          }
+        )
+      );
+    }
+
+    return () => {
+      unsubscribes.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [sessionUser]);
 
   //Student see materials 
   useEffect(() => {
@@ -515,9 +568,9 @@ export default function DashboardPage() {
   }, [searchKeyword, enrichedEnrolledCourses]);
 
 
-  async function handleCreateRescheduleRequest(session, payload) {
+  async function handleCreateRescheduleRequest(requestContext, payload) {
     if (!sessionUser) return;
-    if (!session?.id) return;
+    if (!requestContext?.courseId) return;
 
     const requestedDate = payload.requestedDate?.trim();
     if (!requestedDate) {
@@ -525,26 +578,82 @@ export default function DashboardPage() {
       return;
     }
 
-    setSubmittingRequestSessionId(session.id);
+    const requestTargetSession = requestContext.requestTargetSession || null;
+    const requestSubmitKey =
+      requestContext.requestSubmitKey ||
+      (requestTargetSession?.id ? requestTargetSession.id : `course:${requestContext.courseId}`);
+    setSubmittingRequestSessionId(requestSubmitKey);
 
     try {
-      await addDoc(collection(db, "rescheduleRequests"), {
-        sessionId: session.id,
-        courseId: session.courseId ?? "",
-        courseTitle: session.courseTitle ?? "",
-        sessionDate: session.date ?? "",
-        sessionStartTime: session.startTime ?? "",
-        teacherUid: session.teacherUid ?? "",
-        teacherEmail: session.teacherEmail ?? "",
+      const sessionId = requestTargetSession?.id ?? "";
+      const courseId = requestContext.courseId ?? "";
+      const pendingMatches = (rescheduleRequests || []).filter((request) => {
+        const status = String(request?.status || "pending").toLowerCase();
+        if (status !== "pending") return false;
+        if ((request?.studentUid || "") !== (sessionUser?.uid || "")) return false;
+        if ((request?.courseId || "") !== courseId) return false;
+        return (request?.sessionId || "") === sessionId;
+      });
+      const existingPending =
+        pendingMatches.find(
+          (request) =>
+            String(request?.teacherUid || "").trim() ||
+            String(request?.teacherEmail || "").trim()
+        ) ||
+        pendingMatches[0] ||
+        null;
+      const fallbackCourseRequest = (rescheduleRequests || []).find((request) => {
+        if ((request?.courseId || "") !== courseId) return false;
+        const hasTeacher = (request?.teacherUid || "").trim() || (request?.teacherEmail || "").trim();
+        return Boolean(hasTeacher);
+      });
+      const fallbackSessionForCourse = (lessonSessions || []).find((session) => {
+        if (session?.archived) return false;
+        if ((session?.courseId || "") !== courseId) return false;
+        return Boolean((session?.teacherUid || "").trim() || (session?.teacherEmail || "").trim());
+      });
+
+      const resolvedTeacherUid =
+        (requestTargetSession?.teacherUid || "").trim() ||
+        (requestContext.teacherUid || "").trim() ||
+        (existingPending?.teacherUid || "").trim() ||
+        (fallbackCourseRequest?.teacherUid || "").trim() ||
+        (fallbackSessionForCourse?.teacherUid || "").trim();
+      const resolvedTeacherEmail =
+        (requestTargetSession?.teacherEmail || "").trim() ||
+        (requestContext.teacherEmail || "").trim() ||
+        (existingPending?.teacherEmail || "").trim() ||
+        (fallbackCourseRequest?.teacherEmail || "").trim() ||
+        (fallbackSessionForCourse?.teacherEmail || "").trim();
+      const requestPayload = {
+        sessionId,
+        courseId,
+        courseTitle: requestContext.courseTitle ?? "",
+        sessionDate: requestTargetSession?.date ?? existingPending?.sessionDate ?? "",
+        sessionStartTime: requestTargetSession?.startTime ?? existingPending?.sessionStartTime ?? "",
+        teacherUid: resolvedTeacherUid,
+        teacherEmail: resolvedTeacherEmail,
         studentUid: sessionUser.uid,
         studentEmail: sessionUser.email ?? "",
         studentName: sessionUser.profileName || sessionUser.email || "Student",
         requestedDate,
         requestedTime: payload.requestedTime?.trim() || "",
         message: payload.message?.trim() || "",
-        status: "pending",
-        createdAt: serverTimestamp(),
-      });
+        requestMode: requestTargetSession?.id ? "session" : "course",
+      };
+
+      if (existingPending?.id) {
+        await updateDoc(doc(db, "rescheduleRequests", existingPending.id), {
+          ...requestPayload,
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await addDoc(collection(db, "rescheduleRequests"), {
+          ...requestPayload,
+          status: "pending",
+          createdAt: serverTimestamp(),
+        });
+      }
     } catch (error) {
       console.error("Failed to submit reschedule request", error);
       alert("Unable to submit your request. Please try again.");
@@ -1676,7 +1785,7 @@ function StudentAttendance({
   showPast,
   onToggleShowPast,
 }) {
-  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [activeRequestKey, setActiveRequestKey] = useState(null);
   const [requestDate, setRequestDate] = useState('');
   const [requestTime, setRequestTime] = useState('');
   const [requestMessage, setRequestMessage] = useState('');
@@ -1780,8 +1889,120 @@ function StudentAttendance({
     return expectedDays.includes(sessionDay);
   }
 
-  const relevantSessions = (lessonSessions || [])
-    .filter((session) => {
+  const activeAttendanceRecords = useMemo(() => {
+    return (attendanceRecords || []).filter((record) => {
+      const courseId = String(record?.courseId || "").trim();
+      if (!courseId) return true;
+      const activeFrom = enrollmentActiveFromByCourse.get(courseId) || 0;
+      if (!activeFrom) return true;
+      const markedMs = toMillis(record?.markedAt);
+      if (!Number.isFinite(markedMs)) return true;
+      return markedMs >= activeFrom - 60 * 1000;
+    });
+  }, [attendanceRecords, enrollmentActiveFromByCourse]);
+
+  const activeRescheduleRequests = useMemo(() => {
+    return (rescheduleRequests || []).filter((request) => {
+      const courseId = String(request?.courseId || "").trim();
+      if (!courseId) return true;
+      const activeFrom = enrollmentActiveFromByCourse.get(courseId) || 0;
+      if (!activeFrom) return true;
+      const createdMs = toMillis(request?.createdAt);
+      if (!Number.isFinite(createdMs)) return true;
+      return createdMs >= activeFrom - 60 * 1000;
+    });
+  }, [rescheduleRequests, enrollmentActiveFromByCourse]);
+
+  const attendanceSessionIds = useMemo(() => {
+    const set = new Set();
+    for (const record of activeAttendanceRecords || []) {
+      if (record?.sessionId) set.add(record.sessionId);
+    }
+    return set;
+  }, [activeAttendanceRecords]);
+
+  const approvedRequestSessionIds = useMemo(() => {
+    const set = new Set();
+    for (const request of activeRescheduleRequests || []) {
+      const status = String(request?.status || "").toLowerCase();
+      if (status !== "approved") continue;
+      if (request?.sessionId) set.add(request.sessionId);
+    }
+    return set;
+  }, [activeRescheduleRequests]);
+
+  const approvedRequestDateKeysByCourse = useMemo(() => {
+    const map = new Map();
+    for (const request of activeRescheduleRequests || []) {
+      const status = String(request?.status || "").toLowerCase();
+      if (status !== "approved") continue;
+      const courseId = request?.courseId;
+      if (!courseId) continue;
+      const dateValue = (request?.approvedDate || request?.requestedDate || "").trim();
+      if (!dateValue) continue;
+      const timeValue = (request?.approvedTime || request?.requestedTime || "").trim();
+      const key = `${dateValue}|${timeValue}`;
+      if (!map.has(courseId)) {
+        map.set(courseId, new Set());
+      }
+      map.get(courseId).add(key);
+      if (!timeValue) {
+        map.get(courseId).add(`${dateValue}|`);
+      }
+    }
+    return map;
+  }, [activeRescheduleRequests]);
+
+  function sessionMatchesApprovedRequest(session) {
+    if (!session?.id || !session?.courseId || !session?.date) return false;
+    if (approvedRequestSessionIds.has(session.id)) return true;
+    const keys = approvedRequestDateKeysByCourse.get(session.courseId);
+    if (!keys || !keys.size) return false;
+    const startTime = String(session.startTime || "").trim();
+    return keys.has(`${session.date}|${startTime}`) || keys.has(`${session.date}|`);
+  }
+
+  function getSessionDedupKey(session) {
+    if (!session) return "";
+    const courseId = String(session.courseId || "").trim();
+    const date = String(session.date || "").trim();
+    const startTime = String(session.startTime || "").trim();
+    if (courseId && date && startTime) {
+      return `${courseId}|${date}|${startTime}`;
+    }
+    return String(session.id || "");
+  }
+
+  function getSessionDisplayScore(session) {
+    if (!session) return -1;
+    let score = 0;
+    if (attendanceSessionIds.has(session.id)) score += 100;
+    if (sessionMatchesApprovedRequest(session)) score += 70;
+    if (String(session.source || "").toLowerCase() !== "fixed_weekly_slot") score += 20;
+    if ((session.meetingUrl || session.location || "").trim()) score += 10;
+    return score;
+  }
+
+  function choosePreferredSession(current, next) {
+    if (!current) return next;
+    const currentScore = getSessionDisplayScore(current);
+    const nextScore = getSessionDisplayScore(next);
+    if (nextScore !== currentScore) {
+      return nextScore > currentScore ? next : current;
+    }
+
+    const currentCreatedMs = toMillis(current?.createdAt);
+    const nextCreatedMs = toMillis(next?.createdAt);
+    if (Number.isFinite(currentCreatedMs) && Number.isFinite(nextCreatedMs) && nextCreatedMs !== currentCreatedMs) {
+      return nextCreatedMs > currentCreatedMs ? next : current;
+    }
+    if (Number.isFinite(nextCreatedMs) && !Number.isFinite(currentCreatedMs)) {
+      return next;
+    }
+    return current;
+  }
+
+  const filteredSessions = (lessonSessions || []).filter((session) => {
       if (!courseIds.has(session.courseId)) return false;
       if (session.archived) return false;
       if (!session?.date) return true;
@@ -1790,39 +2011,73 @@ function StudentAttendance({
       const enrollmentActiveFrom = enrollmentActiveFromByCourse.get(session.courseId) || 0;
       if (enrollmentActiveFrom && sessionTime < enrollmentActiveFrom - 60 * 1000) return false;
       const criteria = enrollmentSlotCriteriaByCourse.get(session.courseId);
-      if (sessionTime >= now && !sessionMatchesSlotCriteria(session, criteria)) return false;
+      const slotMatched = sessionMatchesSlotCriteria(session, criteria);
+      const approvedMatched = sessionMatchesApprovedRequest(session);
+      const attendanceMatched = attendanceSessionIds.has(session.id);
+      if (sessionTime >= now && !slotMatched && !approvedMatched && !attendanceMatched) return false;
       return sessionTime >= pastLimit;
-    })
-    .sort((a, b) => {
-      const dateA = new Date((a.date || '') + 'T' + (a.startTime || '00:00'));
-      const dateB = new Date((b.date || '') + 'T' + (b.startTime || '00:00'));
-      return dateB.getTime() - dateA.getTime();
     });
 
+  const relevantSessionMap = new Map();
+  for (const session of filteredSessions) {
+    const dedupKey = getSessionDedupKey(session);
+    const existing = relevantSessionMap.get(dedupKey);
+    relevantSessionMap.set(dedupKey, choosePreferredSession(existing, session));
+  }
+
+  const relevantSessions = Array.from(relevantSessionMap.values()).sort((a, b) => {
+    const dateA = new Date((a.date || '') + 'T' + (a.startTime || '00:00'));
+    const dateB = new Date((b.date || '') + 'T' + (b.startTime || '00:00'));
+    return dateB.getTime() - dateA.getTime();
+  });
+
   const attendanceMap = new Map();
-  for (const record of attendanceRecords || []) {
-    if (record.studentEmail === studentEmail || record.studentUid) {
+  for (const record of activeAttendanceRecords || []) {
+    if (record?.sessionId) {
       attendanceMap.set(record.sessionId, record);
     }
   }
 
+  function choosePreferredRequest(current, next) {
+    if (!current) return next;
+    const currentStatus = (current?.status || "pending").toLowerCase();
+    const nextStatus = (next?.status || "pending").toLowerCase();
+    const currentPending = currentStatus === "pending";
+    const nextPending = nextStatus === "pending";
+    if (currentPending !== nextPending) {
+      return nextPending ? next : current;
+    }
+
+    const currentMs = toMillis(current?.createdAt);
+    const nextMs = toMillis(next?.createdAt);
+    if (Number.isFinite(currentMs) && Number.isFinite(nextMs) && nextMs !== currentMs) {
+      return nextMs > currentMs ? next : current;
+    }
+    if (Number.isFinite(nextMs) && !Number.isFinite(currentMs)) {
+      return next;
+    }
+    return current;
+  }
+
   const requestsBySession = useMemo(() => {
     const map = new Map();
-    for (const request of rescheduleRequests || []) {
+    for (const request of activeRescheduleRequests || []) {
       if (!request?.sessionId) continue;
       const existing = map.get(request.sessionId);
-      if (!existing) {
-        map.set(request.sessionId, request);
-      } else {
-        const prevTime = existing.createdAt || '';
-        const nextTime = request.createdAt || '';
-        if (nextTime > prevTime) {
-          map.set(request.sessionId, request);
-        }
-      }
+      map.set(request.sessionId, choosePreferredRequest(existing, request));
     }
     return map;
-  }, [rescheduleRequests]);
+  }, [activeRescheduleRequests]);
+
+  const requestsByCourse = useMemo(() => {
+    const map = new Map();
+    for (const request of activeRescheduleRequests || []) {
+      if (!request?.courseId) continue;
+      const existing = map.get(request.courseId);
+      map.set(request.courseId, choosePreferredRequest(existing, request));
+    }
+    return map;
+  }, [activeRescheduleRequests]);
 
   const meetingLinkByCourse = useMemo(() => {
     const upcoming = [];
@@ -1971,42 +2226,56 @@ function StudentAttendance({
     return `${year}-${month}-${day}`;
   }
 
+  function getSlotRequestKey(slot) {
+    if (!slot) return "";
+    return slot.requestTargetSession?.id || `course:${slot.id}`;
+  }
+
   function openRequestForm(slot) {
     const targetSession = slot?.requestTargetSession;
-    if (!targetSession?.id) return;
+    const requestKey = getSlotRequestKey(slot);
+    if (!requestKey) return;
     const preferredDate =
       slot?.nextSession?.date ||
       slot?.estimatedNextLessonDateValue ||
-      targetSession.date ||
+      targetSession?.date ||
       "";
     const preferredTime =
       slot?.nextSession?.startTime ||
       slot?.preferredStartTime ||
-      targetSession.startTime ||
+      targetSession?.startTime ||
       "";
 
-    setActiveSessionId(targetSession.id);
+    setActiveRequestKey(requestKey);
     setRequestDate(preferredDate);
     setRequestTime(preferredTime);
     setRequestMessage('');
   }
 
-  async function handleSubmitRequest(event) {
+  async function handleSubmitRequest(event, slot) {
     event.preventDefault();
-    if (!activeSessionId) return;
-    const session = (lessonSessions || []).find((item) => item.id === activeSessionId);
-    if (!session) return;
+    if (!slot) return;
     if (!requestDate.trim()) {
       alert('Please choose a preferred make-up date.');
       return;
     }
 
-    await onSubmitReschedule?.(session, {
+    await onSubmitReschedule?.(
+      {
+        requestSubmitKey: getSlotRequestKey(slot),
+        requestTargetSession: slot.requestTargetSession || null,
+        courseId: slot.id,
+        courseTitle: slot.title,
+        teacherUid: slot.teacherUid || "",
+        teacherEmail: slot.teacherEmail || "",
+      },
+      {
       requestedDate: requestDate,
       requestedTime: requestTime,
       message: requestMessage,
-    });
-    setActiveSessionId(null);
+      }
+    );
+    setActiveRequestKey(null);
     setRequestMessage('');
   }
 
@@ -2066,7 +2335,10 @@ function StudentAttendance({
         }
       }
 
-      if (!sessionMatchesSlotCriteria(session, slotCriteria)) continue;
+      const slotMatched = sessionMatchesSlotCriteria(session, slotCriteria);
+      const approvedMatched = sessionMatchesApprovedRequest(session);
+      const attendanceMatched = attendanceSessionIds.has(session.id);
+      if (!slotMatched && !approvedMatched && !attendanceMatched) continue;
       if (!session?.date) {
         if (!fallbackUndatedSession && isAfterEnrollmentActivation) fallbackUndatedSession = session;
       } else {
@@ -2107,7 +2379,17 @@ function StudentAttendance({
       fallbackLatestSession ||
       fallbackUndatedSession ||
       null;
-    const linkedRequest = requestTargetSession ? requestsBySession.get(requestTargetSession.id) : null;
+    const sessionLinkedRequest = requestTargetSession
+      ? requestsBySession.get(requestTargetSession.id)
+      : null;
+    const fallbackCourseRequest = requestsByCourse.get(course.id) || null;
+    const fallbackStatus = (fallbackCourseRequest?.status || "").toLowerCase();
+    const linkedRequest =
+      sessionLinkedRequest ||
+      (fallbackCourseRequest && fallbackStatus === "pending" ? fallbackCourseRequest : null);
+    const linkedRequestStatus = (linkedRequest?.status || "").toLowerCase();
+    const canRequestReschedule =
+      !linkedRequest || linkedRequestStatus === "rejected";
     const linkedRequestStyle =
       linkedRequest && requestStatusStyles[linkedRequest.status || "pending"];
     const sessionMeetingLink =
@@ -2141,13 +2423,18 @@ function StudentAttendance({
       nextSession,
       nextSessionLabel,
       requestTargetSession,
+      requestSubmitKey: requestTargetSession?.id || `course:${course.id}`,
       linkedRequest,
+      linkedRequestStatus,
+      canRequestReschedule,
       linkedRequestStyle,
       meetingLink,
       isPaid,
       joinDisabledReason,
       preferredStartTime: startTime,
       estimatedNextLessonDateValue,
+      teacherUid: enrollment.teacherUid || "",
+      teacherEmail: enrollment.teacherEmail || "",
     };
   });
 
@@ -2220,8 +2507,7 @@ function StudentAttendance({
                   >
                     {slot.slotLabel}
                   </span>
-                  {slot.requestTargetSession &&
-                    (!slot.linkedRequest || (slot.linkedRequest.status || "pending") !== "pending") && (
+                  {slot.canRequestReschedule ? (
                     <button
                       type="button"
                       onClick={() => openRequestForm(slot)}
@@ -2240,9 +2526,15 @@ function StudentAttendance({
                     >
                       Request reschedule
                     </button>
-                  )}
+                  ) : null}
                 </div>
               </div>
+
+              {!slot.requestTargetSession && (
+                <p style={{ margin: 0, fontSize: "11px", color: "#64748b" }}>
+                  No lesson session has been published yet. You can still submit a request and your teacher will be notified.
+                </p>
+              )}
 
               <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", alignItems: "center" }}>
                 {slot.meetingLink && slot.isPaid ? (
@@ -2307,20 +2599,34 @@ function StudentAttendance({
                     lineHeight: 1.5,
                   }}
                 >
+                  {(() => {
+                    const requestStatus = (slot.linkedRequest.status || "pending").toLowerCase();
+                    const displayDate =
+                      requestStatus === "approved"
+                        ? slot.linkedRequest.approvedDate || slot.linkedRequest.requestedDate
+                        : slot.linkedRequest.requestedDate;
+                    const displayTime =
+                      requestStatus === "approved"
+                        ? slot.linkedRequest.approvedTime || slot.linkedRequest.requestedTime
+                        : slot.linkedRequest.requestedTime;
+                    return (
+                      <>
                   <strong style={{ fontWeight: 600 }}>
                     Reschedule {(slot.linkedRequestStyle && slot.linkedRequestStyle.label) || slot.linkedRequest.status}:
                   </strong>{" "}
-                  {slot.linkedRequest.requestedDate || "Date pending"}
-                  {slot.linkedRequest.requestedTime ? ` ${slot.linkedRequest.requestedTime}` : ""}
+                  {displayDate || "Date pending"}
+                  {displayTime ? ` ${displayTime}` : ""}
                   {slot.linkedRequest.resolutionNote
                     ? ` · Instructor note: ${slot.linkedRequest.resolutionNote}`
                     : ""}
+                      </>
+                    );
+                  })()}
                 </div>
               )}
 
-              {slot.requestTargetSession &&
-                activeSessionId === slot.requestTargetSession.id &&
-                (!slot.linkedRequest || (slot.linkedRequest.status || "pending") !== "pending") && (
+              {activeRequestKey === slot.requestSubmitKey &&
+                slot.canRequestReschedule && (
                 <div
                   style={{
                     borderRadius: "14px",
@@ -2329,7 +2635,7 @@ function StudentAttendance({
                     padding: "14px",
                   }}
                 >
-                  <form onSubmit={handleSubmitRequest} style={{ display: "grid", gap: "10px" }}>
+                  <form onSubmit={(event) => handleSubmitRequest(event, slot)} style={{ display: "grid", gap: "10px" }}>
                     <div
                       style={{
                         display: "grid",
@@ -2395,29 +2701,29 @@ function StudentAttendance({
                     <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
                       <button
                         type="submit"
-                        disabled={submittingRequestId === slot.requestTargetSession.id}
+                        disabled={submittingRequestId === slot.requestSubmitKey}
                         style={{
                           padding: "9px 16px",
                           borderRadius: "10px",
                           border: "none",
-                          background: submittingRequestId === slot.requestTargetSession.id
+                          background: submittingRequestId === slot.requestSubmitKey
                             ? "#94a3b8"
                             : "linear-gradient(120deg, #0ea5e9, #0284c7)",
                           color: "white",
                           fontWeight: 600,
                           cursor:
-                            submittingRequestId === slot.requestTargetSession.id
+                            submittingRequestId === slot.requestSubmitKey
                               ? "not-allowed"
                               : "pointer",
                         }}
                       >
-                        {submittingRequestId === slot.requestTargetSession.id
+                        {submittingRequestId === slot.requestSubmitKey
                           ? "Sending..."
                           : "Submit request"}
                       </button>
                       <button
                         type="button"
-                        onClick={() => setActiveSessionId(null)}
+                        onClick={() => setActiveRequestKey(null)}
                         style={{
                           padding: "9px 16px",
                           borderRadius: "10px",
@@ -2606,13 +2912,28 @@ function StudentAttendance({
                   lineHeight: 1.5,
                 }}
               >
+                {(() => {
+                  const requestStatus = (relatedRequest.status || "pending").toLowerCase();
+                  const displayDate =
+                    requestStatus === "approved"
+                      ? relatedRequest.approvedDate || relatedRequest.requestedDate
+                      : relatedRequest.requestedDate;
+                  const displayTime =
+                    requestStatus === "approved"
+                      ? relatedRequest.approvedTime || relatedRequest.requestedTime
+                      : relatedRequest.requestedTime;
+                  return (
+                    <>
                 <strong style={{ fontWeight: 600 }}>Reschedule request:</strong>{' '}
                 {(requestStyle && requestStyle.label) || (relatedRequest && relatedRequest.status)}
-                {relatedRequest?.requestedDate
-                  ? ' · ' + relatedRequest.requestedDate + (relatedRequest.requestedTime ? ' ' + relatedRequest.requestedTime : '')
+                {displayDate
+                  ? ' · ' + displayDate + (displayTime ? ' ' + displayTime : '')
                   : ''}
                 {relatedRequest?.message ? ' · ' + relatedRequest.message : ''}
                 {relatedRequest?.resolutionNote ? ' · Instructor note: ' + relatedRequest.resolutionNote : ''}
+                    </>
+                  );
+                })()}
               </div>
             )}
 

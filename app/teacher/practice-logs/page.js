@@ -1,4 +1,4 @@
-"use client";
+﻿"use client";
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
@@ -35,7 +35,7 @@ export default function TeacherPracticeLogsPage() {
     }
   }, [sessionUser, loading, router]);
 
-  //监听 practiceLogs 
+  // Subscribe to practiceLogs
   useEffect(() => {
     if (!sessionUser) return;
 
@@ -177,7 +177,7 @@ export default function TeacherPracticeLogsPage() {
         alert("Unable to save feedback. Please try again.");
       });
   }
-//更新 practiceLogs 这条记录
+// Update practiceLogs record status
   function handleStatusChange(entryId, status) {
     updateDoc(doc(db, "practiceLogs", entryId), {
       status,
@@ -251,7 +251,7 @@ export default function TeacherPracticeLogsPage() {
         alert("Unable to save progress. Please try again.");
       });
   }
-//生成课程筛选用的课程列表
+  // Build course options for filters.
   const coursesForFilter = useMemo(() => {
     const seen = new Map();
     const addCourse = (id, title) => {
@@ -266,7 +266,7 @@ export default function TeacherPracticeLogsPage() {
     return Array.from(seen.entries()).sort((a, b) => (a[1] || "").localeCompare(b[1] || ""));
   }, [logs, enrollmentMap, progressRecords]);
 
-//老师端练习记录列表的总过滤器
+// Teacher-side filter for practice log list
   const filteredLogs = useMemo(() => {
     const search = searchTerm.trim().toLowerCase();
     const allowCourse = (email, uid, courseId) => {
@@ -298,8 +298,16 @@ export default function TeacherPracticeLogsPage() {
   }, [filteredLogs]);
 
   const [collapsedGroups, setCollapsedGroups] = useState({});
+  const [collapsedProgressItems, setCollapsedProgressItems] = useState({});
+  const [collapsedProgressGroups, setCollapsedProgressGroups] = useState({});
   const toggleGroup = (key) => {
     setCollapsedGroups((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
+  const toggleProgressItem = (itemId) => {
+    setCollapsedProgressItems((prev) => ({ ...prev, [itemId]: !prev[itemId] }));
+  };
+  const toggleProgressGroup = (groupKey) => {
+    setCollapsedProgressGroups((prev) => ({ ...prev, [groupKey]: !prev[groupKey] }));
   };
 
   const progressItems = useMemo(() => {
@@ -379,6 +387,58 @@ export default function TeacherPracticeLogsPage() {
       return matchesCourse && matchesSearch;
     });
   }, [progressItems, courseFilter, searchTerm]);
+
+  const groupedProgressItems = useMemo(() => {
+    const map = new Map();
+    for (const item of filteredProgressItems) {
+      const key = item.courseTitle || "Other";
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(item);
+    }
+    return Array.from(map.entries());
+  }, [filteredProgressItems]);
+
+  useEffect(() => {
+    const validIds = new Set(filteredProgressItems.map((item) => item.id));
+    setCollapsedProgressItems((prev) => {
+      const next = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        if (validIds.has(key)) {
+          next[key] = value;
+        }
+      });
+      return next;
+    });
+  }, [filteredProgressItems]);
+
+  useEffect(() => {
+    const validKeys = new Set(groupedProgressItems.map(([groupKey]) => groupKey));
+    setCollapsedProgressGroups((prev) => {
+      const next = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        if (validKeys.has(key)) {
+          next[key] = value;
+        }
+      });
+      return next;
+    });
+  }, [groupedProgressItems]);
+
+  function collapseAllProgressGroups() {
+    const next = {};
+    groupedProgressItems.forEach(([groupKey]) => {
+      next[groupKey] = true;
+    });
+    setCollapsedProgressGroups(next);
+  }
+
+  function expandAllProgressGroups() {
+    const next = {};
+    groupedProgressItems.forEach(([groupKey]) => {
+      next[groupKey] = false;
+    });
+    setCollapsedProgressGroups(next);
+  }
 
   const statusCounts = useMemo(() => {
     const counts = { pending: 0, reviewed: 0, attention: 0 };
@@ -594,6 +654,42 @@ export default function TeacherPracticeLogsPage() {
                 Adjust each student&apos;s completion percentage and leave a short milestone note.
               </p>
             </div>
+            {filteredProgressItems.length > 0 && (
+              <div style={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                <button
+                  type="button"
+                  onClick={expandAllProgressGroups}
+                  style={{
+                    padding: "8px 12px",
+                    borderRadius: "999px",
+                    border: "1px solid rgba(37,99,235,0.35)",
+                    backgroundColor: "#eff6ff",
+                    color: "#1d4ed8",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  Expand all groups
+                </button>
+                <button
+                  type="button"
+                  onClick={collapseAllProgressGroups}
+                  style={{
+                    padding: "8px 12px",
+                    borderRadius: "999px",
+                    border: "1px solid rgba(148,163,184,0.45)",
+                    backgroundColor: "white",
+                    color: "#334155",
+                    fontSize: "12px",
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  Collapse all groups
+                </button>
+              </div>
+            )}
           </div>
 
           {filteredProgressItems.length === 0 ? (
@@ -601,151 +697,206 @@ export default function TeacherPracticeLogsPage() {
               No students match the current filters. Encourage students to log practice to start tracking progress.
             </p>
           ) : (
-            filteredProgressItems.map((item) => {
-              const draft = progressDrafts[item.id];
-              const progressValue =
-                typeof draft?.progress === "number"
-                  ? draft.progress
-                  : typeof item.progress === "number"
-                  ? item.progress
-                  : 0;
-              const sliderValue = Number.isFinite(Number(progressValue)) ? Number(progressValue) : 0;
-              const displayProgress = Math.max(0, Math.min(100, Math.round(sliderValue)));
-              const noteValue = draft?.note ?? item.note ?? "";
-              const lastUpdated = item.updatedAt
-                ? new Date(item.updatedAt).toLocaleString()
-                : null;
-
-              return (
-                <article
-                  key={item.id}
+            groupedProgressItems.map(([courseTitle, items]) => (
+              <div key={courseTitle} style={{ display: "grid", gap: "12px" }}>
+                <div
                   style={{
-                    borderRadius: "18px",
-                    border: "1px solid rgba(226,232,240,0.8)",
-                    padding: "18px",
-                    backgroundColor: "white",
-                    boxShadow: "0 16px 34px rgba(15,23,42,0.08)",
-                    display: "grid",
-                    gap: "12px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    backgroundColor: "rgba(248,250,252,0.9)",
+                    borderRadius: "12px",
+                    padding: "10px 14px",
+                    border: "1px solid rgba(226,232,240,0.7)",
+                    cursor: "pointer",
                   }}
+                  onClick={() => toggleProgressGroup(courseTitle)}
                 >
-                  <header
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      flexWrap: "wrap",
-                      gap: "10px",
-                      alignItems: "center",
-                    }}
-                  >
-                    <div>
-                      <p style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
-                        {item.studentName} · {item.studentEmail || "email unavailable"}
-                      </p>
-                      <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>
-                        {item.courseTitle}
-                        {item.courseLevel ? ` (${item.courseLevel})` : ""}
-                      </p>
-                    </div>
-                    <span
-                      style={{
-                        padding: "6px 10px",
-                        borderRadius: "999px",
-                        backgroundColor: "rgba(59,130,246,0.1)",
-                        color: "#1d4ed8",
-                        fontWeight: 700,
-                        fontSize: "12px",
-                      }}
-                    >
-                      {displayProgress}%
-                    </span>
-                  </header>
+                  <strong style={{ color: "#0f172a", fontSize: "14px" }}>{courseTitle}</strong>
+                  <span style={{ fontSize: "12px", color: "#475569", display: "flex", alignItems: "center", gap: "8px" }}>
+                    {items.length} students
+                    <span style={{ fontSize: "14px" }}>{collapsedProgressGroups[courseTitle] ? "▸" : "▾"}</span>
+                  </span>
+                </div>
 
-                  <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
-                    <input
-                      type="range"
-                      min="0"
-                      max="100"
-                      value={sliderValue}
-                      onChange={(event) => {
-                        const value = Number(event.target.value);
-                        setProgressDrafts((prev) => {
-                          const prevDraft = prev[item.id] ?? {};
-                          return {
-                            ...prev,
-                            [item.id]: {
-                              progress: value,
-                              note: prevDraft.note ?? item.note ?? "",
-                            },
-                          };
-                        });
-                      }}
-                      style={{ flexGrow: 1, accentColor: "#2563eb" }}
-                    />
-                  </div>
+                {!collapsedProgressGroups[courseTitle] &&
+                  items.map((item) => {
+                    const draft = progressDrafts[item.id];
+                    const progressValue =
+                      typeof draft?.progress === "number"
+                        ? draft.progress
+                        : typeof item.progress === "number"
+                        ? item.progress
+                        : 0;
+                    const sliderValue = Number.isFinite(Number(progressValue)) ? Number(progressValue) : 0;
+                    const displayProgress = Math.max(0, Math.min(100, Math.round(sliderValue)));
+                    const noteValue = draft?.note ?? item.note ?? "";
+                    const lastUpdated = item.updatedAt
+                      ? new Date(item.updatedAt).toLocaleString()
+                      : null;
+                    const isCollapsed = Boolean(collapsedProgressItems[item.id]);
 
-                  <label style={{ display: "grid", gap: "6px" }}>
-                    <span style={{ fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
-                      Milestone / instructor note
-                    </span>
-                    <textarea
-                      value={noteValue}
-                      onChange={(event) => {
-                        const value = event.target.value;
-                        setProgressDrafts((prev) => {
-                          const prevDraft = prev[item.id] ?? {};
-                          return {
-                            ...prev,
-                            [item.id]: {
-                              progress:
-                                typeof prevDraft.progress === "number"
-                                  ? prevDraft.progress
-                                  : typeof item.progress === "number"
-                                  ? item.progress
-                                  : 0,
-                              note: value,
-                            },
-                          };
-                        });
-                      }}
-                      rows={3}
-                      placeholder="e.g. Completed Unit 2 repertoire, ready to start arpeggios."
-                      style={{
-                        padding: "12px",
-                        borderRadius: "14px",
-                        border: "1px solid rgba(148,163,184,0.5)",
-                        fontSize: "13px",
-                        resize: "vertical",
-                        backgroundColor: "#f8fafc",
-                        color: "#0f172a",
-                      }}
-                    />
-                  </label>
+                    return (
+                      <article
+                        key={item.id}
+                        style={{
+                          borderRadius: "18px",
+                          border: "1px solid rgba(226,232,240,0.8)",
+                          padding: "18px",
+                          backgroundColor: "white",
+                          boxShadow: "0 16px 34px rgba(15,23,42,0.08)",
+                          display: "grid",
+                          gap: "12px",
+                        }}
+                      >
+                        <header
+                          style={{
+                            display: "flex",
+                            justifyContent: "space-between",
+                            flexWrap: "wrap",
+                            gap: "10px",
+                            alignItems: "center",
+                          }}
+                        >
+                          <div>
+                            <p style={{ fontSize: "13px", fontWeight: 600, color: "#0f172a" }}>
+                              {item.studentName} {" \u00B7 "} {item.studentEmail || "email unavailable"}
+                            </p>
+                            <p style={{ fontSize: "12px", color: "#475569", marginTop: "4px" }}>
+                              {item.courseTitle}
+                              {item.courseLevel ? ` (${item.courseLevel})` : ""}
+                            </p>
+                          </div>
+                          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                            <span
+                              style={{
+                                padding: "6px 10px",
+                                borderRadius: "999px",
+                                backgroundColor: "rgba(59,130,246,0.1)",
+                                color: "#1d4ed8",
+                                fontWeight: 700,
+                                fontSize: "12px",
+                              }}
+                            >
+                              {displayProgress}%
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => toggleProgressItem(item.id)}
+                              style={{
+                                width: "30px",
+                                height: "30px",
+                                borderRadius: "999px",
+                                border: "1px solid rgba(148,163,184,0.45)",
+                                backgroundColor: "white",
+                                color: "#334155",
+                                fontWeight: 700,
+                                cursor: "pointer",
+                                lineHeight: 1,
+                              }}
+                              aria-label={isCollapsed ? "Expand progress details" : "Collapse progress details"}
+                              title={isCollapsed ? "Expand" : "Collapse"}
+                            >
+                              {isCollapsed ? "+" : "-"}
+                            </button>
+                          </div>
+                        </header>
 
-                  <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
-                    <button
-                      type="button"
-                      onClick={() => handleSaveProgress(item)}
-                      style={{
-                        padding: "12px 16px",
-                        borderRadius: "12px",
-                        border: "none",
-                        background: "linear-gradient(120deg, #2563eb, #1d4ed8)",
-                        color: "white",
-                        fontWeight: 700,
-                        cursor: "pointer",
-                        boxShadow: "0 14px 30px rgba(37,99,235,0.2)",
-                      }}
-                    >
-                      Save progress
-                    </button>
-                    <p style={{ fontSize: "11px", color: "#94a3b8" }}>
-                      {lastUpdated ? `Last updated ${lastUpdated}` : "No instructor updates yet."}
-                    </p>
-                  </div>
-                </article>
-              );
-            })
+                        {isCollapsed ? (
+                          <p style={{ fontSize: "11px", color: "#94a3b8", margin: 0 }}>
+                            {lastUpdated ? `Last updated ${lastUpdated}` : "No instructor updates yet."}
+                          </p>
+                        ) : (
+                          <>
+                            <div style={{ display: "flex", alignItems: "center", gap: "12px" }}>
+                              <input
+                                type="range"
+                                min="0"
+                                max="100"
+                                value={sliderValue}
+                                onChange={(event) => {
+                                  const value = Number(event.target.value);
+                                  setProgressDrafts((prev) => {
+                                    const prevDraft = prev[item.id] ?? {};
+                                    return {
+                                      ...prev,
+                                      [item.id]: {
+                                        progress: value,
+                                        note: prevDraft.note ?? item.note ?? "",
+                                      },
+                                    };
+                                  });
+                                }}
+                                style={{ flexGrow: 1, accentColor: "#2563eb" }}
+                              />
+                            </div>
+
+                            <label style={{ display: "grid", gap: "6px" }}>
+                              <span style={{ fontSize: "12px", fontWeight: 600, color: "#0f172a" }}>
+                                Milestone / instructor note
+                              </span>
+                              <textarea
+                                value={noteValue}
+                                onChange={(event) => {
+                                  const value = event.target.value;
+                                  setProgressDrafts((prev) => {
+                                    const prevDraft = prev[item.id] ?? {};
+                                    return {
+                                      ...prev,
+                                      [item.id]: {
+                                        progress:
+                                          typeof prevDraft.progress === "number"
+                                            ? prevDraft.progress
+                                            : typeof item.progress === "number"
+                                            ? item.progress
+                                            : 0,
+                                        note: value,
+                                      },
+                                    };
+                                  });
+                                }}
+                                rows={3}
+                                placeholder="e.g. Completed Unit 2 repertoire, ready to start arpeggios."
+                                style={{
+                                  padding: "12px",
+                                  borderRadius: "14px",
+                                  border: "1px solid rgba(148,163,184,0.5)",
+                                  fontSize: "13px",
+                                  resize: "vertical",
+                                  backgroundColor: "#f8fafc",
+                                  color: "#0f172a",
+                                }}
+                              />
+                            </label>
+
+                            <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
+                              <button
+                                type="button"
+                                onClick={() => handleSaveProgress(item)}
+                                style={{
+                                  padding: "12px 16px",
+                                  borderRadius: "12px",
+                                  border: "none",
+                                  background: "linear-gradient(120deg, #2563eb, #1d4ed8)",
+                                  color: "white",
+                                  fontWeight: 700,
+                                  cursor: "pointer",
+                                  boxShadow: "0 14px 30px rgba(37,99,235,0.2)",
+                                }}
+                              >
+                                Save progress
+                              </button>
+                              <p style={{ fontSize: "11px", color: "#94a3b8" }}>
+                                {lastUpdated ? `Last updated ${lastUpdated}` : "No instructor updates yet."}
+                              </p>
+                            </div>
+                          </>
+                        )}
+                      </article>
+                    );
+                  })}
+              </div>
+            ))
           )}
         </section>
 
@@ -821,10 +972,10 @@ export default function TeacherPracticeLogsPage() {
                       >
                         <div>
                           <p style={{ fontSize: "13px", fontWeight: 700, color: "#0f172a", margin: 0 }}>
-                            {entry.studentName} · {entry.studentEmail}
+                            {entry.studentName} {" \u00B7 "} {entry.studentEmail}
                           </p>
                           <p style={{ fontSize: "12px", color: "#475569", margin: "4px 0 0" }}>
-                            {entry.courseTitle} {entry.courseLevel ? `(${entry.courseLevel})` : ""} · {entry.minutes} min ·{" "}
+                            {entry.courseTitle} {entry.courseLevel ? `(${entry.courseLevel})` : ""} {" \u00B7 "} {entry.minutes} min{" \u00B7 "}
                             {new Date(entry.date || entry.createdAt).toLocaleDateString()}
                           </p>
                         </div>
@@ -883,7 +1034,7 @@ export default function TeacherPracticeLogsPage() {
                               flexShrink: 0,
                             }}
                           >
-                            {entry.mediaType?.startsWith("video") ? "▶️ Watch" : "🎧 Listen"}
+                            {entry.mediaType?.startsWith("video") ? "Watch" : "Listen"}
                             <span style={{ color: "#475569", fontWeight: 600 }}>
                               {entry.mediaName ? `(${entry.mediaName})` : "submission"}
                             </span>
@@ -891,9 +1042,9 @@ export default function TeacherPracticeLogsPage() {
                         )}
                         <p style={{ fontSize: "11px", color: "#94a3b8", margin: 0 }}>
                           <span>Submission: {entry.id || "N/A"}</span>
-                          {entry.mediaDuration ? ` · Duration: ${entry.mediaDuration}` : ""}
+                          {entry.mediaDuration ? ` \u00B7 Duration: ${entry.mediaDuration}` : ""}
                           {entry.mediaSize
-                            ? ` · Size: ${
+                            ? ` \u00B7 Size: ${
                                 entry.mediaSize > 1024 * 1024
                                   ? `${(entry.mediaSize / (1024 * 1024)).toFixed(1)} MB`
                                   : `${Math.ceil(entry.mediaSize / 1024)} KB`
